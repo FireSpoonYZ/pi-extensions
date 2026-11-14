@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.10.8] - 2026-11-15
+
+### Fixed
+
+- **Pi default identity prompt compatibility with `agy` turns.** When `systemPrompt` is enabled, `agy` turns triggered repeated `RESOURCE_EXHAUSTED` (429) responses when sent Pi's unmodified default leading identity sentence (`You are a coding assistant running inside pi, a coding agent harness.`). Both the ACP carrier path and the `stream-json` path (staged carrier and inline fallback) now replace only that exact leading sentence with `You are a coding assistant.`, preserving all subsequent system instructions, `AGENTS.md` context, skills, and the live MCP tool catalog unchanged. Custom system prompts without that exact leading sentence and `systemPrompt: false` behavior are unaffected.
+
 ## [1.10.7] - 2026-11-15
 
 ### Changed

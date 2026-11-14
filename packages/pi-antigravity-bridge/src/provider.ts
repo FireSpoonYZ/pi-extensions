@@ -170,6 +170,16 @@ export const SYSTEM_PROMPT_PREAMBLE =
 
 export const SYSTEM_PROMPT_END = "[END SYSTEM PROMPT]";
 
+const PI_DEFAULT_IDENTITY_RE = /^You are a coding assistant running inside pi, a coding agent harness\./;
+
+/** Replace Pi's exact leading default identity sentence with neutral wording
+ *  when present; sending the unmodified leading sentence triggers repeated
+ *  RESOURCE_EXHAUSTED 429 responses on agy. Preserves all subsequent text and
+ *  leaves custom prompts untouched. */
+function adaptPiSystemPrompt(systemPrompt: string): string {
+	return systemPrompt.replace(PI_DEFAULT_IDENTITY_RE, "You are a coding assistant.");
+}
+
 /** Brief tool-priority note appended inside every system prompt block: agy
  *  runs embedded in pi, so its native interactive tools never reach the
  *  user. Equivalent Pi Bridge tools must win. Concrete clashes observed
@@ -1509,7 +1519,9 @@ async function runTurnDriver(
 	// conversation id, so later gate-closed turns pass the same agent.
 	let stagedAgentName: string | undefined;
 	const resolveAcpAgent = (): string | null => {
-		const acpSysPrompt = config.systemPrompt ? getCurrentSystemPrompt(context.messages) || undefined : undefined;
+		const acpSysPrompt = config.systemPrompt
+			? adaptPiSystemPrompt(getCurrentSystemPrompt(context.messages)) || undefined
+			: undefined;
 		const body = buildAcpAgentBody(acpSysPrompt, deps.bridgeCatalog?.());
 		return stageSyspromptAgent(body, { acp: true });
 	};
@@ -1607,7 +1619,9 @@ async function runTurnDriver(
 			stagedAgentName = stagedName;
 		} else {
 			const gateOpen = config.systemPrompt && !existing?.conversationId;
-			const rawSysPrompt = gateOpen ? getCurrentSystemPrompt(context.messages) || undefined : undefined;
+			const rawSysPrompt = gateOpen
+				? adaptPiSystemPrompt(getCurrentSystemPrompt(context.messages)) || undefined
+				: undefined;
 			sysPrompt = rawSysPrompt;
 			agent = config.agent;
 			if (rawSysPrompt && !config.agent) {
