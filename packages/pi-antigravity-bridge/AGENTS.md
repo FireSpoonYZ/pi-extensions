@@ -1,4 +1,4 @@
-Project: **@estebanforge/pi-antigravity-bridge**
+Project: **@firespoon/pi-antigravity-bridge** (forked from `@estebanforge/pi-antigravity-bridge`)
 Stack: **TypeScript / Node.js (ESNext / ES2022, ESM module)** targeting Node.js 22+, built as a streaming Gemini provider extension for `pi` (`@earendil-works/pi-coding-agent`) with TWO turn engines behind one contract: the default **ACP engine** (`src/acp/*`, `agy acp` over JSON-RPC stdio) and the fallback **stream-json engine** (persistent `agy` CLI process).
 
 ## STRUCTURE

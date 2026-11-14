@@ -1,7 +1,7 @@
 {
-  "name": "@estebanforge/pi-antigravity-bridge",
-  "version": "1.10.6",
-  "description": "Gemini provider for Pi on the Antigravity ACP server (official Google ACP) or the stream-json agy CLI. Use antigravity/* models in Pi. Full /model picker support. Models runs Pi's tools. ToS safe to use.",
+  "name": "@firespoon/pi-antigravity-bridge",
+  "version": "1.10.7",
+  "description": "Gemini provider and AskAntigravity tool for Pi on the Antigravity ACP server (restricted custom agent with Pi tools via MCP) or the stream-json agy CLI fallback. Use antigravity/* models in Pi with /model picker support.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -20,13 +20,23 @@
   ],
   "license": "MIT",
   "author": {
-    "name": "EstebanForge",
-    "email": "esteban@attitude.cl",
-    "url": "https://actitud.xyz"
+    "name": "FireSpoonYZ",
+    "url": "https://github.com/FireSpoonYZ"
+  },
+  "contributors": [
+    {
+      "name": "EstebanForge",
+      "email": "esteban@attitude.cl",
+      "url": "https://actitud.xyz"
+    }
+  ],
+  "homepage": "https://github.com/FireSpoonYZ/pi-extensions#readme",
+  "bugs": {
+    "url": "https://github.com/FireSpoonYZ/pi-extensions/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/EstebanForge/pi-extensions.git",
+    "url": "git+https://github.com/FireSpoonYZ/pi-extensions.git",
     "directory": "packages/pi-antigravity-bridge"
   },
   "publishConfig": {

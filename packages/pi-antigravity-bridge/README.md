@@ -2,6 +2,7 @@
 
 A Gemini model provider **and** the `AskAntigravity` delegation tool for [pi](https://github.com/earendil-works/pi), built on the official `agy` CLI: **`agy acp`** by default, with the stream-json CLI engine kept as the fallback. It registers `antigravity/gemini-*` models in pi's `/model` picker (streaming), and provides the `AskAntigravity` tool for one-shot delegation - the same combined shape as `pi-claude-bridge`.
 
+> **Fork notice:** Maintained at [FireSpoonYZ/pi-extensions](https://github.com/FireSpoonYZ/pi-extensions) and published as `@firespoon/pi-antigravity-bridge`, forked from upstream [EstebanForge/pi-extensions](https://github.com/EstebanForge/pi-extensions/tree/main/packages/pi-antigravity-bridge) (`@estebanforge/pi-antigravity-bridge`).
 
 If you also have [`@estebanforge/pi-ask-antigravity`](https://github.com/EstebanForge/pi-extensions/tree/main/packages/pi-ask-antigravity) installed, this bridge takes over: pi-ask-antigravity detects the bridge and registers nothing, so the `AskAntigravity` tool is never duplicated.
 
@@ -84,7 +85,7 @@ Full mechanics, configuration, and a sample gate extension: [docs/APPROVAL-GATE.
 Install with pi's package manager:
 
 ```bash
-pi install npm:@estebanforge/pi-antigravity-bridge
+pi install npm:@firespoon/pi-antigravity-bridge
 ```
 
 Requires the **`agy` CLI** installed and authenticated. On an interactive start without it, the extension offers once per process to run Google's official installer after your confirmation, without blocking bridge startup. Linux and macOS use `set -o pipefail; curl -fsSL https://antigravity.google/cli/install.sh | bash`; Windows PowerShell uses `irm https://antigravity.google/cli/install.ps1 | iex`. Installation is verified before the success message. Then run `agy` once to complete Google OAuth and restart pi. The extension resolves `agy` on `$PATH`, or via `AGY_BIN`; a bad explicit override gets correction instructions instead of an install. Headless sessions print the instructions without installing.
