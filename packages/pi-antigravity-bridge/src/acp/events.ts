@@ -65,12 +65,31 @@ export function mapUpdate(update: unknown): MappedUpdate {
 			const id = stringField(u.toolCallId);
 			if (!id) return null;
 			const nativeMcp = nativeMcpTool(u);
+			const metaName = metaToolName(u._meta);
+			const rawArgs = rawArguments(u.rawInput);
+			const resolvedName = metaName ?? nativeMcp?.name ?? stringField(u.name) ?? toolName(u.title, u.kind);
+			let name = resolvedName;
+			let args = rawArgs;
+			let mcpServer = stringField(recordField(recordField(u._meta).mcp).server) ?? nativeMcp?.server;
+			// Native agy also invokes MCP tools via the generic `call_mcp_tool`
+			// dispatcher ({ ServerName, ToolName, Arguments }). Unwrap only our
+			// known pi-bridge / pi-bridge-<pid> server so Pi UI skips duplicate
+			// native cards without mislabeling foreign MCP servers or other tools.
+			if (!mcpServer && (resolvedName === "call_mcp_tool" || stringField(u.title) === "call_mcp_tool")) {
+				const server = stringField(rawArgs.ServerName);
+				const tool = stringField(rawArgs.ToolName);
+				if (server && /^pi-bridge(?:-\d+)?$/.test(server) && tool) {
+					name = tool;
+					mcpServer = server;
+					args = recordField(rawArgs.Arguments);
+				}
+			}
 			return {
 				kind: "tool_start",
 				toolCallId: id,
-				name: metaToolName(u._meta) ?? nativeMcp?.name ?? stringField(u.name) ?? toolName(u.title, u.kind),
-				args: rawArguments(u.rawInput),
-				mcpServer: stringField(recordField(recordField(u._meta).mcp).server) ?? nativeMcp?.server,
+				name,
+				args,
+				mcpServer,
 				// Edits carry their native diff HERE, on the pending tool_call
 				// frame (run 6:10) — the completed update carries only display
 				// text. contentDiff on the update stays as a future-build

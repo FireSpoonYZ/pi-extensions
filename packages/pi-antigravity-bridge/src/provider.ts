@@ -1172,6 +1172,8 @@ export interface DriverDeps {
 	onNativeBackground?: (info: { conversationId: string; turnStartMs: number }) => void;
 	/** Subagent roster fold target (both engines; best-effort telemetry). */
 	roster?: SubagentRoster;
+	/** Live Pi bridge tool catalog forwarded from StreamSimpleDeps for ACP. */
+	bridgeCatalog?: () => BridgeCatalogEntry[];
 	/** Active engine (config), for engine-scoped session keys. */
 	engine: "stream-json" | "acp";
 	/** Daily file log sink for pre-dispatch errors (see StreamSimpleDeps). */
@@ -1954,6 +1956,7 @@ export function createStreamSimple(
 				onNativeEvent: deps.onNativeEvent,
 				onNativeBackground: deps.onNativeBackground,
 				roster: deps.roster,
+				bridgeCatalog: deps.bridgeCatalog,
 				// Record the engine of the driver that will ACTUALLY run: if the
 				// ACP driver is absent, the config switch falls back to stream,
 				// and keying the session as @acp would store a stream
