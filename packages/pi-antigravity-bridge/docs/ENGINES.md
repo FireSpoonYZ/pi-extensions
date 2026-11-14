@@ -28,15 +28,26 @@ Existing installs clean up the retired ACP server only under `~/.local/opt/agy-a
 | Review-only provider turns | Refused; the CLI does not enforce plan read-only | Refused by the bridge |
 | Dynamic model / effort switch | Recycles process on drift | Per-turn `model` and `thought_level` config options |
 | Process lifecycle | Persistent `agy` process | Persistent `agy acp` process |
-| Session resume | `--conversation <id>` | `session/load` and `session/new` |
+| Session resume | `--conversation <id>` | `session/load` and `session/new` (versioned session key preserves legacy ACP conversations without reusing them automatically) |
 | Turn cancel | Kills process group | `session/cancel` notification, with teardown fallback |
-| MCP tool bridge | Isolated per-session MCP home (`--gemini_dir`); global registration is the probe-verified fallback | Direct `mcpServers` plus a sanitized private MCP home |
-| Tool visibility | Native re-exec plus wrapper replay | Display-only native tool cards |
+| MCP tool bridge | Isolated per-session MCP home (`--gemini_dir`); global registration is the probe-verified fallback (`bridgeTools: all` includes active Pi builtins) | Injects only the current Pi bridge via `mcpServers` with no foreign globally inherited MCP; generated restricted agent sets `tools: []` so all tools route through the Pi bridge (`all` includes active Pi builtins; `mcp` adapter + skills only; `none` leaves no tools) |
+| Tool visibility | Native re-exec plus wrapper replay (plus genuine Pi cards for bridged tools) | Genuine Pi tool cards via MCP bridge round-trips (`toolUse -> Pi executes -> toolResult completes MCP`); display-only native ACP cards retained as event compatibility |
 | Context digest | Inline prompt text | `embeddedContext` resource block |
-| System prompt | Staged agy agent file | Prepended to the first prompt |
+| System prompt | Staged agy agent file (`--agent`; `/agy agent` is stream-json only) | Carried in generated restricted custom agent body (`--agent generated`, `--include-default-customizations=false`); `systemPrompt: false` suppresses Pi text only |
 | Authentication | Shared `agy` CLI credentials | Shared `agy` CLI credentials |
 | Wire protocol | CLI NDJSON stream | JSON-RPC 2.0 over stdio |
 
 ## Switching and authentication
 
 Switch with `/agy engine acp|stream-json`, then restart pi. `/agy auth` and `/agy auth-manual` show the shared CLI authentication instructions. `/agy doctor` checks the CLI version and reports the active ACP server version without spending tokens. Sessions are engine-scoped, so switching engines never crosses conversations.
+
+## Restricted ACP profile and tool catalog
+
+On `acp`, the provider spawns `agy acp` as a generated restricted custom agent (`--agent generated`, `--include-default-customizations=false`) configured with `excludeDefaultComponents: true`, `tools: []`, `inheritMcp: true`, `inheritCustomizations: false`, and empty `skills`/`rules`/`agents`/`hooks`/`plugins`. Only the current session's Pi MCP bridge is injected (no foreign globally inherited MCP servers), and Pi's `systemPrompt` is placed in the generated agent's body rather than the first ACP user message (`systemPrompt: false` suppresses Pi's text only while keeping the restricted profile and protocol instructions). Existing `ToolRoundTrips` (`toolUse -> Pi executes -> toolResult completes MCP`) handle all bridged tools, and native ACP step rendering stays in place only for event compatibility.
+
+Because ACP uses a new versioned session key, prior ACP conversations are preserved and are not reused automatically — start a **new Pi conversation** to pick up the new restricted profile. `/agy agent` remains `stream-json` only (no new user-facing toggles), and `stream-json` keeps its existing fallback behavior with native tools and staged Pi carrier.
+
+Under `bridgeTools`:
+- **`all`** (default): exposes every **active** Pi tool, including active Pi builtins (`read`, `write`, `edit`, `bash`, etc.), extension tools, `pi-mcp-adapter` tools, and other `Ask*` delegations (excluding the bridge's own internal tools).
+- **`mcp`**: exposes only active `pi-mcp-adapter` tools plus the skills bridge — on the restricted ACP agent (`tools: []`), the model has no Pi builtins or non-adapter extension tools.
+- **`none`**: turns the MCP bridge off — on the restricted ACP agent (`tools: []`), the model has **no tools at all** (text-only), whereas `stream-json` retains agy's own native tools.

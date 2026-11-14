@@ -22,8 +22,6 @@ export function bridgedPiTools(
 		tool.name !== "AskAntigravity" && tool.name !== "antigravity" &&
 		tool.name !== "agy_web_search" && tool.name !== "agy_read_url" &&
 		tool.name !== "bridge_poll_result" && tool.name !== "activate_skill" &&
-		(mode === "mcp"
-			? /pi-mcp-adapter/.test(tool.sourceInfo?.source ?? "")
-			: tool.sourceInfo?.source !== "builtin"),
+		(mode !== "mcp" || /pi-mcp-adapter/.test(tool.sourceInfo?.source ?? "")),
 	);
 }

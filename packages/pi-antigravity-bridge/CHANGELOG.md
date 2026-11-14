@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- **ACP provider runs as a generated restricted custom agent with Pi system prompt in the agent body.** `agy acp` spawns with `--agent generated` and `--include-default-customizations=false` (`excludeDefaultComponents: true`, `tools: []`, `inheritMcp: true`, `inheritCustomizations: false`, empty `skills`/`rules`/`agents`/`hooks`/`plugins`), injects only the current Pi MCP bridge (no foreign globally inherited MCP), and carries Pi's `systemPrompt` in the generated agent body instead of the first ACP user message (`systemPrompt: false` suppresses Pi text only, keeping the restricted profile and protocol instructions). ACP uses a new versioned session key so old conversations are preserved and not reused automatically — start a new Pi conversation to use the new profile. Tool execution routes through Pi's MCP bridge round-trips (`toolUse -> Pi executes -> toolResult completes MCP`), while native ACP step rendering stays in place as event compatibility. `stream-json` remains the fallback engine with native tools, staged Pi carrier, and `/agy agent` (stream-json only).
+- **`bridgeTools: "all"` now includes active Pi builtin tools.** Removed the `sourceInfo.source !== "builtin"` exclusion in `bridgedPiTools` while preserving active-set, `/agy tools` hidden-set, and internal/self-recursion filters. `bridgeTools: "mcp"` remains limited to active `pi-mcp-adapter` tools (+ skills), and `bridgeTools: "none"` disables the bridge — on the restricted ACP agent (`tools: []`), `mcp` leaves no Pi builtins or non-adapter extensions and `none` leaves the model with no tools at all.
+
 ## [1.10.6] - 2026-11-13
 
 ### Fixed
