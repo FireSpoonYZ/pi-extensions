@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { isPidAlive } from "../mcp-server.js";
 import { bridgeServerEntry, bridgeServerName, readGlobalMcpConfig } from "../mcp-registration.js";
+import { isValidAgyAgentName } from "../agents.js";
 
 function record(value: unknown, label: string): Record<string, unknown> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must contain a JSON object`);
@@ -11,6 +12,25 @@ function record(value: unknown, label: string): Record<string, unknown> {
 
 function linkDirectory(source: string, target: string): void {
 	fs.symlinkSync(source, target, "junction");
+}
+
+function resolveCarrierAgentMd(agent: string, geminiHome: string, explicitRoot?: string): string {
+	const candidates = [
+		explicitRoot,
+		process.env.AGY_AGENTS_ROOT,
+		path.join(geminiHome, "config", "agents"),
+		path.join(os.homedir(), ".gemini", "config", "agents"),
+	];
+	for (const root of candidates) {
+		if (!root) continue;
+		const file = path.join(root, agent, "agent.md");
+		try {
+			if (fs.statSync(file).isFile()) return file;
+		} catch {
+			/* try next candidate */
+		}
+	}
+	throw new Error(`ACP carrier agent "${agent}" not found`);
 }
 
 /** Staging root for isolated agy homes. The directory name predates the
@@ -32,29 +52,55 @@ export interface StageAgyHomeOptions {
 	 *  agy never reads global - a marker-disabled own entry would break G9
 	 *  silently inside our own home. Omit when the bridge is off. */
 	ownBridge?: { pid: number; port: number; token: string; tokenHeader: string };
+	/** Inherit foreign/global MCP entries from global mcp_config.json (default
+	 *  true for stream-json; ACP sets false because session/new and
+	 *  session/load already inject the session's pi-bridge). */
+	inheritGlobalMcp?: boolean;
+	/** Generated carrier agent name for ACP restricted sessions. Copied into
+	 *  <staged>/config/agents/<agent>/agent.md as a real directory (never
+	 *  junctioned to global agents) so AGY_AGENTS_ROOT works and global
+	 *  agents dirs are never mutated. */
+	agent?: string;
+	/** Explicit agent discovery root for tests; falls back to AGY_AGENTS_ROOT
+	 *  then geminiHome/config/agents. */
+	agentsRoot?: string;
 }
 
 /** Isolate a spawned agy from per-pid bridge entries in the global MCP
- *  config: the staged home carries the global servers minus every
- *  pi-bridge-*, plus (optionally) exactly this session's bridge entry. */
+ *  config: the staged home carries the global servers (when inheritGlobalMcp
+ *  is true) minus every pi-bridge-*, plus (optionally) this session's bridge
+ *  entry. When an ACP carrier agent is set, stages only that agent into a
+ *  real config/agents/<agent> directory without junctioning global agents. */
 export function stageAgyHome(opts: StageAgyHomeOptions = {}): string {
 	const geminiHome = opts.geminiHome ?? path.join(os.homedir(), ".gemini");
 	const globalConfigDir = path.join(geminiHome, "config");
 	const globalMcpPath = path.join(globalConfigDir, "mcp_config.json");
-	let config: Record<string, unknown> = { mcpServers: {} };
-	try {
-		// Tolerant of the CLI's 0-byte fresh-install file and a UTF-8 BOM;
-		// only a missing file means "no config at all" (issue #11).
-		config = record(readGlobalMcpConfig(globalMcpPath), globalMcpPath);
-	} catch (err) {
-		if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-			throw new Error(`Cannot isolate inherited MCP config ${globalMcpPath}: ${err instanceof Error ? err.message : String(err)}`);
+	const inheritGlobalMcp = opts.inheritGlobalMcp ?? true;
+	let carrierMd: string | undefined;
+	if (opts.agent !== undefined) {
+		if (!isValidAgyAgentName(opts.agent)) {
+			throw new Error(`Invalid ACP agent name: ${opts.agent}`);
 		}
+		carrierMd = resolveCarrierAgentMd(opts.agent, geminiHome, opts.agentsRoot);
 	}
-	const servers = record(config.mcpServers ?? {}, `${globalMcpPath} mcpServers`);
-	const filtered: Record<string, unknown> = Object.fromEntries(
-		Object.entries(servers).filter(([name]) => !/^pi-bridge(?:-\d+)?$/.test(name)),
-	);
+
+	let config: Record<string, unknown> = { mcpServers: {} };
+	let filtered: Record<string, unknown> = {};
+	if (inheritGlobalMcp) {
+		try {
+			// Tolerant of the CLI's 0-byte fresh-install file and a UTF-8 BOM;
+			// only a missing file means "no config at all" (issue #11).
+			config = record(readGlobalMcpConfig(globalMcpPath), globalMcpPath);
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+				throw new Error(`Cannot isolate inherited MCP config ${globalMcpPath}: ${err instanceof Error ? err.message : String(err)}`);
+			}
+		}
+		const servers = record(config.mcpServers ?? {}, `${globalMcpPath} mcpServers`);
+		filtered = Object.fromEntries(
+			Object.entries(servers).filter(([name]) => !/^pi-bridge(?:-\d+)?$/.test(name)),
+		);
+	}
 	if (opts.ownBridge) {
 		filtered[bridgeServerName(opts.ownBridge.pid)] = bridgeServerEntry({ ...opts.ownBridge, disabled: false });
 	}
@@ -70,10 +116,12 @@ export function stageAgyHome(opts: StageAgyHomeOptions = {}): string {
 		const appData = path.join(geminiHome, "antigravity-cli");
 		if (fs.existsSync(appData)) linkDirectory(appData, path.join(staged, "antigravity-cli"));
 		const instructions = path.join(geminiHome, "GEMINI.md");
-		if (fs.existsSync(instructions)) fs.copyFileSync(instructions, path.join(staged, "GEMINI.md"));
+		if (inheritGlobalMcp && fs.existsSync(instructions)) fs.copyFileSync(instructions, path.join(staged, "GEMINI.md"));
+		const skipAgentsJunction = Boolean(opts.agent) || !inheritGlobalMcp;
 		if (fs.existsSync(globalConfigDir)) {
 			for (const entry of fs.readdirSync(globalConfigDir, { withFileTypes: true })) {
 				if (entry.name === "mcp_config.json") continue;
+				if (skipAgentsJunction && entry.name === "agents") continue;
 				const source = path.join(globalConfigDir, entry.name);
 				const target = path.join(staged, "config", entry.name);
 				let stat: fs.Stats | fs.Dirent = entry;
@@ -88,6 +136,11 @@ export function stageAgyHome(opts: StageAgyHomeOptions = {}): string {
 				if (stat.isDirectory()) linkDirectory(source, target);
 				else if (stat.isFile()) fs.copyFileSync(source, target);
 			}
+		}
+		if (opts.agent && carrierMd) {
+			const targetDir = path.join(staged, "config", "agents", opts.agent);
+			fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+			fs.writeFileSync(path.join(targetDir, "agent.md"), fs.readFileSync(carrierMd), { mode: 0o600 });
 		}
 		return staged;
 	} catch (err) {

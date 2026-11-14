@@ -181,6 +181,12 @@ export const SYSTEM_PROMPT_END = "[END SYSTEM PROMPT]";
 export const TOOL_PRIORITY_NOTE =
 	"[Tool priority: this conversation runs inside pi, not as a standalone agy session; the user only sees what surfaces in pi. Native interactive tools, for example ask_question, never reach the user. When a Pi Bridge tool covers the same purpose, always use the Pi Bridge tool; for user questions use ask_user_question. Your native file tools such as view_file only read brain artifacts and reject real filesystem paths; for any path on the user's machine use the Pi Bridge tools (read, ls, grep, find, edit, execute). Image files are visible to you: the Pi Bridge read tool returns image files as visible images (png, jpg, webp, gif, bmp), so never claim you cannot view images. When a bridge call answers STILL RUNNING, poll bridge_poll_result before doing other work: until you poll, the result (including any image) stays undelivered to you. Delegate subagent work the same way: when pi's tool list includes a delegation tool (for example subagent, Agent, agent_spawn, agent_wait, or subagent_run), always delegate through it and never through the native invoke_subagent, run_subagent, or manage_subagents; use native ones only if no pi delegation tool is listed, because native subagents run inside agy and are invisible to pi and anything watching it. Long-running bridge calls do not fail: after ~20 seconds the bridge answers STILL RUNNING with a callId; fetch the result with bridge_poll_result and poll until it lands. For work you already know is long, prefer exec_command's session-output pattern or background agents so you keep working while it runs.]";
 
+/** Short bridge protocol note for the ACP restricted carrier agent.
+ *  ACP runs with tools: [] and no default components, so native-tool priority
+ *  guidance is omitted; all tools arrive via pi-bridge MCP. */
+export const ACP_BRIDGE_NOTE =
+	"[Pi bridge protocol: this conversation runs inside pi. All user-facing actions and workspace tools run through pi-bridge MCP tools. Image tools (such as read) return visible images directly (png, jpg, webp, gif, bmp), so never claim you cannot view images. If a pi-bridge tool call answers STILL RUNNING with a callId, call bridge_poll_result with that callId and keep polling until the result (including any image) is delivered.]";
+
 /** Assemble the full agy prompt: system prompt block, pi-side digest, user
  *  prompt. Empty parts are dropped. Pure; exported for unit testing.
  *  Pass systemPrompt only on a fresh conversation (see runTurnDriver). */
@@ -353,9 +359,10 @@ function sessionKey(
 	const sid = (options as { sessionId?: string } | undefined)?.sessionId;
 	const base = sid && sid.length > 0 ? `sid:${sid}` : `cwd:${cwd}`;
 	// Engine-scoped keys (plan 9.4): one ACP turn must never touch the stream
-	// binding and vice versa. Un-suffixed keys = stream-json, byte-compatible with
-	// every store that predates the ACP engine.
-	return base + (engine === "acp" ? "@acp" : "");
+	// binding and vice versa. ACP uses a versioned suffix (@acp-v2) so legacy
+	// @acp conversations retain their stored entries without resuming into the
+	// Pi-only restricted agent profile. Un-suffixed keys = stream-json.
+	return base + (engine === "acp" ? "@acp-v2" : "");
 }
 
 /** Track which content block is currently open so we close-on-switch.
@@ -1444,6 +1451,13 @@ async function runTurnDriver(
 	// any. Recorded into stagedAgentByConversation once the outcome binds the
 	// conversation id, so later gate-closed turns pass the same agent.
 	let stagedAgentName: string | undefined;
+	const resolveAcpAgent = (): string | null => {
+		const acpSysPrompt = config.systemPrompt ? getCurrentSystemPrompt(context.messages) || undefined : undefined;
+		const body = acpSysPrompt
+			? [SYSTEM_PROMPT_PREAMBLE, acpSysPrompt, SYSTEM_PROMPT_END, ACP_BRIDGE_NOTE].join("\n\n")
+			: ACP_BRIDGE_NOTE;
+		return stageSyspromptAgent(body, { acp: true });
+	};
 	const active = isContinuation ? deps.driver.reentry() : null;
 	if (active) {
 		handle = active;
@@ -1518,19 +1532,29 @@ async function runTurnDriver(
 		// The uri is suffixed per turn so a deduping server cannot serve stale
 		// content on turn 2+.
 		const embeddedDigest = deps.engine === "acp" && digest ? digest : undefined;
-		// G10, fresh conversations only (bound conversations ride agy's own
-		// history; re-sending would bloat every prompt and bust the cache).
-		// stream-json delivery is a staged agent file, NOT prompt text: agy's
-		// stream-json path silently drops any turn past a ~25KB input cap and
-		// the dropped turn leaves the conversation permanently unresponsive
-		// (issue #2, probed 2026-09-30), and the block routinely crossed it.
-		// ACP keeps the inline block (JSON-RPC transport; --agent is a CLI
-		// feature). A user-configured agent always wins: never clobber it.
-		const gateOpen = config.systemPrompt && !existing?.conversationId;
-		const rawSysPrompt = gateOpen ? getCurrentSystemPrompt(context.messages) || undefined : undefined;
-		let sysPrompt = rawSysPrompt;
-		let agent = config.agent;
-		if (deps.engine !== "acp") {
+		// G10: stream-json stages a carrier agent on fresh conversations (with
+		// inline fallback when staging fails or custom config.agent is set).
+		// ACP always uses a generated restricted carrier agent (Pi system prompt
+		// when config.systemPrompt is true + ACP_BRIDGE_NOTE), ignores custom
+		// config.agent, never prepends system prompt into user prompts, and
+		// fails visibly if carrier staging fails.
+		let sysPrompt: string | undefined;
+		let agent: string | undefined;
+		if (deps.engine === "acp") {
+			const stagedName = resolveAcpAgent();
+			if (!stagedName) {
+				for (const l of late) if (l.callId) deps.roundTrips.unclaim(l.callId);
+				deps.log?.("turn-error", { reason: "acp-agent-stage-failed" }, "error");
+				finalize(stream, blocks, "error", "Failed to stage restricted ACP agent.");
+				return;
+			}
+			agent = stagedName;
+			stagedAgentName = stagedName;
+		} else {
+			const gateOpen = config.systemPrompt && !existing?.conversationId;
+			const rawSysPrompt = gateOpen ? getCurrentSystemPrompt(context.messages) || undefined : undefined;
+			sysPrompt = rawSysPrompt;
+			agent = config.agent;
 			if (rawSysPrompt && !config.agent) {
 				const stagedName = stageSyspromptAgent(
 					[SYSTEM_PROMPT_PREAMBLE, rawSysPrompt, TOOL_PRIORITY_NOTE].join("\n\n"),
@@ -1702,6 +1726,19 @@ async function runTurnDriver(
 		const more = collectStranded();
 		if (more.length > 0) {
 			const conv = redeliveryConversation ?? outcome.conversationId ?? existing?.conversationId ?? null;
+			let lateAgent: string | undefined;
+			if (deps.engine === "acp") {
+				const staged = resolveAcpAgent();
+				if (!staged) {
+					for (const l of more) if (l.callId) deps.roundTrips.unclaim(l.callId);
+					deps.log?.("turn-error", { reason: "acp-agent-stage-failed" }, "error");
+					finalize(stream, blocks, "error", "Failed to stage restricted ACP agent.");
+					return;
+				}
+				lateAgent = staged;
+			} else {
+				lateAgent = config.agent ?? (conv ? stagedAgentByConversation.get(conv) : undefined);
+			}
 			deps.log?.("escalated-redelivery-turn", { tools: more.map((s) => s.name), conversation: conv }, "info");
 			const moreImages = more.flatMap((s) => s.images ?? []);
 			try {
@@ -1716,7 +1753,7 @@ async function runTurnDriver(
 					conversationId: conv,
 					prompt: buildLateResultPrompt(more) + stageImageNote(moreImages),
 					images: moreImages.length > 0 ? moreImages : undefined,
-					agent: config.agent ?? (conv ? stagedAgentByConversation.get(conv) : undefined),
+					agent: lateAgent,
 					signal: options?.signal,
 				});
 				if ((await drainTurn(lateHandle)) === "parked") return;

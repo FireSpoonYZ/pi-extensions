@@ -48,8 +48,14 @@ export interface AcpConnectionOptions {
 	 *  fake-server script for tests). */
 	bin: string;
 	binArgs?: string[];
-	/** Native agy only: filter per-pid bridges out of inherited global MCP. */
-	isolateHome?: boolean | { geminiHome?: string; parentDir?: string };
+	/** Native agy only: isolate inherited global MCP from other pi sessions. */
+	isolateHome?: boolean | { geminiHome?: string; parentDir?: string; agentsRoot?: string };
+	/** Carrier agent name passed as `--agent <name>`. */
+	agent?: string;
+	/** When false, passes `--include-default-customizations=false`. */
+	includeDefaultCustomizations?: boolean;
+	/** Explicit agent discovery root for isolated home staging (tests). */
+	agentsRoot?: string;
 	extraEnv?: Record<string, string>;
 	log: (msg: string, data?: unknown) => void;
 	/** Verified `session/update` payloads (post-suppression). */
@@ -166,8 +172,20 @@ export class AcpConnection {
 	async start(): Promise<void> {
 		if (this.#child) return;
 		const args = [...(this.#opts.binArgs ?? [])];
+		if (this.#opts.agent) {
+			args.push("--agent", this.#opts.agent);
+		}
+		if (this.#opts.includeDefaultCustomizations === false) {
+			args.push("--include-default-customizations=false");
+		}
 		if (this.#opts.isolateHome) {
-			this.#stagedHome = stageAgyHome(typeof this.#opts.isolateHome === "object" ? this.#opts.isolateHome : {});
+			const homeOpts = typeof this.#opts.isolateHome === "object" ? this.#opts.isolateHome : {};
+			this.#stagedHome = stageAgyHome({
+				...homeOpts,
+				inheritGlobalMcp: false,
+				...(this.#opts.agent ? { agent: this.#opts.agent } : {}),
+				...(this.#opts.agentsRoot ? { agentsRoot: this.#opts.agentsRoot } : {}),
+			});
 			args.push("--gemini-dir", this.#stagedHome);
 		}
 		let child: ChildProcess;

@@ -46,9 +46,39 @@ export function syspromptAgentsRoot(): string {
 	return process.env.AGY_AGENTS_ROOT ?? path.join(os.homedir(), ".gemini", "config", "agents");
 }
 
+export interface SyspromptAgentOptions {
+	/** When true, generate the restricted Pi-only ACP carrier agent
+	 *  (no native tools, no default components or inherited customizations). */
+	acp?: boolean;
+}
+
 /** agent.md for the carrier. The body is the pi system prompt composed by the
- *  provider (preamble + transcript system prompt + tool-priority note). */
-export function syspromptAgentMd(name: string, body: string): string {
+ *  provider (or, on ACP, Pi system prompt when enabled plus the bridge
+ *  protocol note). */
+export function syspromptAgentMd(name: string, body: string, opts: SyspromptAgentOptions = {}): string {
+	if (opts.acp) {
+		return [
+			"---",
+			`name: ${name}`,
+			"description: \"Pi bridge ACP carrier: Pi-only restricted agent\"",
+			"mainAgent: true",
+			"model: inherit",
+			"subagent: false",
+			"excludeDefaultComponents: true",
+			"inheritCustomizations: false",
+			"inheritMcp: true",
+			"tools: []",
+			"skills: []",
+			"rules: []",
+			"agents: []",
+			"hooks: []",
+			"plugins: []",
+			"---",
+			"",
+			body,
+			"",
+		].join("\n");
+	}
 	return [
 		"---",
 		`name: ${name}`,
@@ -98,13 +128,15 @@ function bodyHash(body: string): string {
  *  silent-drop guard keeps the cap risk visible. */
 export function stageSyspromptAgent(
 	body: string,
-	opts: { agentsRoot?: string } = {},
+	opts: { agentsRoot?: string; acp?: boolean } = {},
 ): string | null {
 	try {
 		const root = opts.agentsRoot ?? syspromptAgentsRoot();
-		const hash = bodyHash(body);
+		const hash = bodyHash(opts.acp ? `acp\0${body}` : body);
 		const cached = stagedByHash.get(hash);
-		if (cached && cached.root === root) return cached.name;
+		if (cached && cached.root === root && fs.existsSync(path.join(cached.dir, "agent.md"))) {
+			return cached.name;
+		}
 		sweepStaleWebAgents(root, Date.now(), SYS_AGENT_PREFIX);
 		fs.mkdirSync(root, { recursive: true });
 		// Nonce: two pi processes staging the same body must not fight over one
@@ -113,7 +145,7 @@ export function stageSyspromptAgent(
 		const dir = path.join(root, name);
 		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 		fs.writeFileSync(path.join(dir, ".pid"), `${process.pid}\n`, { mode: 0o600 });
-		fs.writeFileSync(path.join(dir, "agent.md"), syspromptAgentMd(name, body), {
+		fs.writeFileSync(path.join(dir, "agent.md"), syspromptAgentMd(name, body, { acp: opts.acp }), {
 			mode: 0o600,
 		});
 		const entry: Staged = { root, name, dir };

@@ -44,6 +44,8 @@ export interface AcpDriverOptions {
 	binArgs?: string[] | (() => string[]);
 	/** Native agy only: isolate inherited global MCP from other pi sessions. */
 	isolateHome?: boolean;
+	/** Explicit agent discovery root for isolated home staging (tests). */
+	agentsRoot?: string;
 	extraEnv?: Record<string, string>;
 	/** Bridge registration for session/new AND session/load. */
 	mcpServers?: () => AcpMcpServer[];
@@ -129,6 +131,7 @@ export class AcpDriver implements TurnDriver {
 	#opts: AcpDriverOptions;
 	#state: DriverState = "idle";
 	#conn: AcpConnection | undefined;
+	#connAgent: string | undefined;
 	#generation = 0;
 	#active: ActiveTurn | undefined;
 	#queueTail: Promise<void> = Promise.resolve();
@@ -243,6 +246,20 @@ export class AcpDriver implements TurnDriver {
 		// /compact after a model switch failed with "ACP driver is shut down."
 		if (request.signal?.aborted) return Promise.reject(new Error("aborted before start"));
 
+		// Recycle BEFORE creating the new active turn and clear #conn first so
+		// the replaced connection's exit lands in #onConnectionExit as stale and
+		// never settles the replacement turn.
+		if (this.#conn && this.#connAgent !== request.agent) {
+			const prev = this.#conn;
+			const from = this.#connAgent ?? null;
+			this.#conn = undefined;
+			this.#connAgent = undefined;
+			this.#state = "dead";
+			this.#log("recycle-agent", { from, to: request.agent ?? null });
+			prev.abortAll("agent changed");
+			prev.kill();
+		}
+
 		const turn = this.#createTurn(request);
 		this.#active = turn;
 		this.#state = "running";
@@ -251,6 +268,7 @@ export class AcpDriver implements TurnDriver {
 			model: request.model,
 			effort: request.effort,
 			mode: request.mode,
+			...(request.agent ? { agent: request.agent } : {}),
 			conversation: request.conversationId ?? null,
 			images: request.images?.length ?? 0,
 			contextBlock: request.contextBlock ? true : undefined,
@@ -502,6 +520,7 @@ export class AcpDriver implements TurnDriver {
 		}
 		const turn = this.#active;
 		this.#conn = undefined;
+		this.#connAgent = undefined;
 		this.#state = "dead";
 		// Teardown exits (abort kill, shutdown, idle recycle) are deliberate:
 		// their stderr tail must never reach the UI. Only a live turn dying
@@ -536,10 +555,15 @@ export class AcpDriver implements TurnDriver {
 		this.#generation += 1;
 		this.#state = "starting";
 		this.#stats.spawns += 1;
+		const restricted = Boolean(request.agent);
+		this.#connAgent = request.agent;
 		const conn = new AcpConnection({
 			bin: typeof this.#opts.bin === "function" ? this.#opts.bin() : this.#opts.bin,
 			binArgs: typeof this.#opts.binArgs === "function" ? this.#opts.binArgs() : this.#opts.binArgs,
 			isolateHome: this.#opts.isolateHome,
+			agent: request.agent,
+			includeDefaultCustomizations: restricted ? false : undefined,
+			agentsRoot: this.#opts.agentsRoot,
 			extraEnv: this.#opts.extraEnv,
 			cwd: request.cwd,
 			mcpServers: this.#opts.mcpServers,
@@ -577,6 +601,7 @@ export class AcpDriver implements TurnDriver {
 				// auth hang) must not leak: it is detached, so it outlives pi.
 				this.#state = "dead";
 				this.#conn = undefined;
+				this.#connAgent = undefined;
 				conn.kill();
 				this.#log("start-failed", { message: describe(err) });
 				throw err;
@@ -881,6 +906,7 @@ export class AcpDriver implements TurnDriver {
 		this.#conn?.abortAll(`driver ${reason}`);
 		this.#conn?.kill();
 		this.#conn = undefined;
+		this.#connAgent = undefined;
 		this.#state = "dead";
 	}
 
