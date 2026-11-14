@@ -130,13 +130,15 @@ export interface AgyConfig {
 	 *  always available. */
 	patchCleanupNotified?: boolean;
 	/** Custom agy agent for stream-json turns (`--agent`, /agy agent).
-	 *  Absent = agy's default agent. ACP turns ignore it (no protocol slot). */
+	 *  Absent = agy's default agent. ACP turns ignore it and always run under
+	 *  the generated Pi-only restricted carrier agent. */
 	agent?: string;
 	/** Which pi tools the MCP bridge exposes to agy: "none" (bridge off),
-	 *  "all" (every registered non-builtin tool incl. other Ask* delegations;
-	 *  default - users expect the bridge working out of the box, and the
-	 *  "mcp" surface serves an empty catalog on installs without
-	 *  pi-mcp-adapter), "mcp" (pi-mcp-adapter tools + skills bridge only). */
+	 *  "all" (every active Pi tool, including active builtins, extension tools,
+	 *  pi-mcp-adapter tools, and other Ask* delegations; default - users expect
+	 *  the bridge working out of the box, and the "mcp" surface serves an empty
+	 *  catalog on installs without pi-mcp-adapter), "mcp" (active pi-mcp-adapter
+	 *  tools + skills bridge only). */
 	bridgeTools: BridgeTools;
 	/** Extra pi tool names that get the long (120s) synchronous escalation
 	 *  window, in addition to delegation-shaped names (subagent_run,

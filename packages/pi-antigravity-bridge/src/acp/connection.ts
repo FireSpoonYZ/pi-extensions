@@ -180,11 +180,21 @@ export class AcpConnection {
 		}
 		if (this.#opts.isolateHome) {
 			const homeOpts = typeof this.#opts.isolateHome === "object" ? this.#opts.isolateHome : {};
+			const sessionMcp = this.#opts.mcpServers?.() ?? [];
+			const agentMcpServers =
+				this.#opts.agent && sessionMcp.length > 0
+					? sessionMcp.map((s) => ({
+							name: s.name,
+							serverUrl: s.url,
+							headers: Object.fromEntries(s.headers.map((h) => [h.name, h.value])),
+						}))
+					: undefined;
 			this.#stagedHome = stageAgyHome({
 				...homeOpts,
 				inheritGlobalMcp: false,
 				...(this.#opts.agent ? { agent: this.#opts.agent } : {}),
 				...(this.#opts.agentsRoot ? { agentsRoot: this.#opts.agentsRoot } : {}),
+				...(agentMcpServers ? { agentMcpServers } : {}),
 			});
 			args.push("--gemini-dir", this.#stagedHome);
 		}

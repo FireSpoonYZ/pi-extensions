@@ -7,8 +7,11 @@
 // deleted (phase 4) without breaking imports.
 //
 // The ACP driver implements the same surface with protocol-native mechanics:
-// no process recycle on profile drift, notification cancel with teardown
-// fallback, and `session/load` resume. See docs/ACP-ADOPTION-PLAN.md section 9.
+// no process recycle on model/mode/effort/cwd drift (handled per turn via
+// session/set_config_option and session/new or session/load; agent changes
+// recycle the process before the next turn), notification cancel with
+// teardown fallback, and `session/load` resume. See docs/ACP-ADOPTION-PLAN.md
+// section 9.
 
 export type DriverState = "idle" | "starting" | "ready" | "running" | "dead";
 
@@ -18,9 +21,10 @@ export interface DriverProfile {
 	effort?: string;
 	mode: string;
 	skipPermissions: boolean;
-	/** Custom agy agent (stream-json `--agent`). ACP has no agent slot in the
-	 *  per-turn agent selection and ignores it; the /agy agent command refuses to set
-	 *  one while the ACP engine is active. */
+	/** Carrier/custom agy agent (`--agent`). Stream-json uses the user's
+	 *  configured agent or staged sysprompt carrier; ACP uses the provider-
+	 *  staged restricted Pi-only carrier agent and recycles the ACP process if
+	 *  its name changes. /agy agent remains stream-json only. */
 	agent?: string;
 }
 

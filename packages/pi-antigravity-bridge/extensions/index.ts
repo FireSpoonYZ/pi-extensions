@@ -203,6 +203,43 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// Session-only visibility overrides; never change either application's MCP config.
 	const hiddenBridgeTools = new Set<string>();
 	const getBridgeTools = () => bridgedPiTools(pi.getAllTools(), pi.getActiveTools(), loadConfig().bridgeTools, hiddenBridgeTools);
+	// Populated on session_start once ctx.isProjectTrusted() is known; empty before start.
+	let bridgeSkills: SkillLite[] = [];
+	const listTools = () => {
+		// /mcp and pi.setActiveTools() update the same live catalog. ACP gets
+		// this endpoint through the private carrier agent + session/new or session/load;
+		// no global config write.
+		const tools = getBridgeTools().map((t) => {
+			let inputSchema: object = { type: "object", properties: {}, additionalProperties: true };
+			try {
+				if (t.parameters) inputSchema = JSON.parse(JSON.stringify(t.parameters)) as object;
+			} catch {
+				/* keep default schema */
+			}
+			return { name: t.name, description: t.description ?? t.name, inputSchema };
+		});
+		if (bridgeSkills.length > 0 && loadConfig().bridgeTools !== "none") {
+			tools.push({
+				name: ACTIVATE_SKILL_TOOL_NAME,
+				description: `Activate a pi Agent Skill by name. Catalog:\n${catalogSummary(bridgeSkills)}`,
+				inputSchema: activateSkillSchema(bridgeSkills) as object,
+			});
+		}
+		// Bridge-local, like activate_skill: answered from the escalation
+		// registry without a pi round-trip. Pairs with the STILL RUNNING
+		// early-ack that keeps slow calls under agy's ~180s request deadline.
+		tools.push({
+			name: POLL_TOOL_NAME,
+			description:
+				"Fetch the result of a long-running bridge tool call that answered STILL RUNNING with a callId. Poll again if it still reports running; the result or an error arrives here.",
+			inputSchema: {
+				type: "object",
+				properties: { callId: { type: "string", description: "callId from the STILL RUNNING answer" } },
+				required: ["callId"],
+			},
+		});
+		return tools;
+	};
 	// Approval-gate hook script (per-pid, token embedded). Written at session
 	// start when the gate is active; removed at session_shutdown.
 	let gateScriptPath: string | null = null;
@@ -341,7 +378,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		log: acpLog,
 		mcpServers: () => {
 			const handle = mcpHandle;
-			if (!handle) return [];
+			if (!handle || loadConfig().bridgeTools === "none") return [];
 			// The bridge 403s any request without the shared-secret header; the
 			// stream engine carries it via mcp_config.json, ACP via headers[].
 			return [
@@ -603,6 +640,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		onNativeEvent,
 		onNativeBackground: (info) => armConversationWatcher(info.conversationId, info.turnStartMs),
 		roster,
+		bridgeCatalog: () => (mcpHandle && loadConfig().bridgeTools !== "none" ? listTools() : []),
 		engine,
 		log: fileLog.log.bind(fileLog),
 	});
@@ -859,41 +897,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		if (mcpHandle) return; // already running (reload re-fires session_start)
 		// pi loads project skill locations only after the project is trusted;
 		// mirror that gate. Global skill dirs are always scanned.
-		const skills: SkillLite[] = scanSkills(ctx.isProjectTrusted() ? process.cwd() : undefined);
-		const listTools = () => {
-			// /mcp and pi.setActiveTools() update the same live catalog. ACP gets
-			// this endpoint through session/new or session/load; no global config write.
-			const tools = getBridgeTools().map((t) => {
-					let inputSchema: object = { type: "object", properties: {}, additionalProperties: true };
-					try {
-						if (t.parameters) inputSchema = JSON.parse(JSON.stringify(t.parameters)) as object;
-					} catch {
-						/* keep default schema */
-					}
-					return { name: t.name, description: t.description ?? t.name, inputSchema };
-				});
-			if (skills.length > 0 && loadConfig().bridgeTools !== "none") {
-				tools.push({
-					name: ACTIVATE_SKILL_TOOL_NAME,
-					description: `Activate a pi Agent Skill by name. Catalog:\n${catalogSummary(skills)}`,
-					inputSchema: activateSkillSchema(skills) as object,
-				});
-			}
-			// Bridge-local, like activate_skill: answered from the escalation
-			// registry without a pi round-trip. Pairs with the STILL RUNNING
-			// early-ack that keeps slow calls under agy's ~180s request deadline.
-			tools.push({
-				name: POLL_TOOL_NAME,
-				description:
-					"Fetch the result of a long-running bridge tool call that answered STILL RUNNING with a callId. Poll again if it still reports running; the result or an error arrives here.",
-				inputSchema: {
-					type: "object",
-					properties: { callId: { type: "string", description: "callId from the STILL RUNNING answer" } },
-					required: ["callId"],
-				},
-			});
-			return tools;
-		};
+		bridgeSkills = scanSkills(ctx.isProjectTrusted() ? process.cwd() : undefined);
 		// activate_skill never round-trips through pi: the bridge answers it
 		// directly by reading the SKILL.md (pi has no skill tool to execute).
 		const bridgeOnToolCall = (
@@ -932,7 +936,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				});
 			}
 			const wanted = typeof args.name === "string" ? args.name : "";
-			const skill = loadConfig().bridgeTools !== "none" ? findSkillByName(skills, wanted) : undefined;
+			const skill = loadConfig().bridgeTools !== "none" ? findSkillByName(bridgeSkills, wanted) : undefined;
 			const body = skill ? readSkillBody(skill) : `unknown skill: ${wanted || "(none given)"}`;
 			return Promise.resolve({
 				content: [
@@ -1647,7 +1651,7 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 						"info",
 					);
 				} else {
-					ui?.notify(`bridge: ${loadConfig().bridgeTools}\nusage: /agy bridge all|mcp|none\n  all: active non-builtin pi tools. mcp: active pi-mcp-adapter tools + skills. none: bridge off.`, "info");
+					ui?.notify(`bridge: ${loadConfig().bridgeTools}\nusage: /agy bridge all|mcp|none\n  all: active pi tools (incl. builtins, extensions, mcp). mcp: active pi-mcp-adapter tools + skills. none: bridge off.`, "info");
 				}
 				return;
 			}
@@ -1836,7 +1840,7 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx: AgyCommandCtx): Promis
 			id: "bridge",
 			label: "Bridge tools",
 			description:
-				"Which pi tools the MCP bridge exposes to agy. all: every non-builtin tool (default). mcp: pi-mcp-adapter tools + skills. none: bridge off.",
+				"Which pi tools the MCP bridge exposes to agy. all: every active pi tool (default). mcp: pi-mcp-adapter tools + skills. none: bridge off.",
 			currentValue: config.bridgeTools,
 			values: ["all", "mcp", "none"],
 		},

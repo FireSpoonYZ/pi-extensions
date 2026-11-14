@@ -181,11 +181,63 @@ export const SYSTEM_PROMPT_END = "[END SYSTEM PROMPT]";
 export const TOOL_PRIORITY_NOTE =
 	"[Tool priority: this conversation runs inside pi, not as a standalone agy session; the user only sees what surfaces in pi. Native interactive tools, for example ask_question, never reach the user. When a Pi Bridge tool covers the same purpose, always use the Pi Bridge tool; for user questions use ask_user_question. Your native file tools such as view_file only read brain artifacts and reject real filesystem paths; for any path on the user's machine use the Pi Bridge tools (read, ls, grep, find, edit, execute). Image files are visible to you: the Pi Bridge read tool returns image files as visible images (png, jpg, webp, gif, bmp), so never claim you cannot view images. When a bridge call answers STILL RUNNING, poll bridge_poll_result before doing other work: until you poll, the result (including any image) stays undelivered to you. Delegate subagent work the same way: when pi's tool list includes a delegation tool (for example subagent, Agent, agent_spawn, agent_wait, or subagent_run), always delegate through it and never through the native invoke_subagent, run_subagent, or manage_subagents; use native ones only if no pi delegation tool is listed, because native subagents run inside agy and are invisible to pi and anything watching it. Long-running bridge calls do not fail: after ~20 seconds the bridge answers STILL RUNNING with a callId; fetch the result with bridge_poll_result and poll until it lands. For work you already know is long, prefer exec_command's session-output pattern or background agents so you keep working while it runs.]";
 
+export interface BridgeCatalogEntry {
+	name: string;
+	description: string;
+	inputSchema: object;
+}
+
 /** Short bridge protocol note for the ACP restricted carrier agent.
  *  ACP runs with tools: [] and no default components, so native-tool priority
  *  guidance is omitted; all tools arrive via pi-bridge MCP. */
 export const ACP_BRIDGE_NOTE =
 	"[Pi bridge protocol: this conversation runs inside pi. All user-facing actions and workspace tools run through pi-bridge MCP tools. Image tools (such as read) return visible images directly (png, jpg, webp, gif, bmp), so never claim you cannot view images. If a pi-bridge tool call answers STILL RUNNING with a callId, call bridge_poll_result with that callId and keep polling until the result (including any image) is delivered.]";
+
+/** Build the restricted ACP carrier agent body: optional Pi system prompt
+ *  (omitted when config.systemPrompt is false), the bridge protocol note, and
+ *  the live pi-bridge tool catalog with explicit call_mcp_tool instructions.
+ *  Exported for pure unit verification; included in the carrier hash so any
+ *  catalog or prompt change stages a distinct agent name and recycles ACP. */
+export function buildAcpAgentBody(
+	systemPrompt: string | undefined,
+	catalog: readonly BridgeCatalogEntry[] | undefined,
+): string {
+	const parts: string[] = [];
+	if (systemPrompt) {
+		parts.push(SYSTEM_PROMPT_PREAMBLE, systemPrompt, SYSTEM_PROMPT_END);
+	}
+	parts.push(ACP_BRIDGE_NOTE);
+	if (catalog !== undefined) {
+		if (catalog.length > 0) {
+			const entries = catalog.map((tool) => {
+				const desc = (tool.description || tool.name).trim();
+				const schema = JSON.stringify(tool.inputSchema ?? { type: "object", properties: {}, additionalProperties: true });
+				return `### ${tool.name}\n${desc}\n\nParameters (JSON Schema):\n\`\`\`json\n${schema}\n\`\`\``;
+			});
+			parts.push(
+				[
+					"# Pi Bridge Tool Protocol",
+					'Invoke Pi bridge tools using the native `call_mcp_tool` function with `ServerName` set to `"pi-bridge"`, `ToolName` set to one of the tool names listed below, and `Arguments` set to a JSON object matching that tool\'s JSON Schema.',
+					"- Use the `pi-bridge` catalog tools directly via `call_mcp_tool` for files, commands, skills, and user interactions.",
+					"- Do NOT call `list_resources`, `read_resource`, or `manage_task`, and do NOT write textual tool call tags; preserve native `call_mcp_tool` function calls.",
+					'- If a `pi-bridge` call answers `STILL RUNNING` with a `callId`, poll `call_mcp_tool` with `ServerName: "pi-bridge"`, `ToolName: "bridge_poll_result"`, and `Arguments: {"callId": "..."}` until the final result arrives.',
+					"",
+					"## Available `pi-bridge` Tools",
+					"",
+					...entries,
+				].join("\n"),
+			);
+		} else {
+			parts.push(
+				[
+					"# Pi Bridge Tool Protocol",
+					"No `pi-bridge` tools are available in this conversation. Do NOT call `call_mcp_tool`, `list_resources`, `read_resource`, or `manage_task`, and do NOT write textual tool call tags; answer directly.",
+				].join("\n"),
+			);
+		}
+	}
+	return parts.join("\n\n");
+}
 
 /** Assemble the full agy prompt: system prompt block, pi-side digest, user
  *  prompt. Empty parts are dropped. Pure; exported for unit testing.
@@ -417,6 +469,9 @@ export interface StreamSimpleDeps {
 	onNativeBackground?: (info: { conversationId: string; turnStartMs: number }) => void;
 	/** Subagent roster (both engines); folded from every activity. */
 	roster?: SubagentRoster;
+	/** Live Pi bridge tool catalog (incl. activate_skill and bridge_poll_result)
+	 *  wired from the extension's listTools closure for ACP agent prompts. */
+	bridgeCatalog?: () => BridgeCatalogEntry[];
 	/** Daily file log sink (src/daily-log.ts). Records pre-dispatch turn
 	 *  errors that never create a driver turn (and so never reach onTurnEnd). */
 	log?: (event: string, data?: unknown, level?: "debug" | "info" | "warn" | "error") => void;
@@ -1453,9 +1508,7 @@ async function runTurnDriver(
 	let stagedAgentName: string | undefined;
 	const resolveAcpAgent = (): string | null => {
 		const acpSysPrompt = config.systemPrompt ? getCurrentSystemPrompt(context.messages) || undefined : undefined;
-		const body = acpSysPrompt
-			? [SYSTEM_PROMPT_PREAMBLE, acpSysPrompt, SYSTEM_PROMPT_END, ACP_BRIDGE_NOTE].join("\n\n")
-			: ACP_BRIDGE_NOTE;
+		const body = buildAcpAgentBody(acpSysPrompt, deps.bridgeCatalog?.());
 		return stageSyspromptAgent(body, { acp: true });
 	};
 	const active = isContinuation ? deps.driver.reentry() : null;

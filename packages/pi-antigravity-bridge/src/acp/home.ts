@@ -40,6 +40,38 @@ export function agyHomeStagingDir(): string {
 	return path.join(os.homedir(), ".pi", "agent", "antigravity-bridge", "acp-homes");
 }
 
+export interface AgentMcpServerSpec {
+	name: string;
+	serverUrl: string;
+	headers?: Record<string, string>;
+}
+
+function formatAgentMcpYaml(servers: readonly AgentMcpServerSpec[]): string {
+	const lines: string[] = ["mcpServers:"];
+	for (const server of servers) {
+		lines.push(`  - name: ${JSON.stringify(server.name)}`);
+		lines.push(`    serverUrl: ${JSON.stringify(server.serverUrl)}`);
+		const headers = server.headers ? Object.entries(server.headers) : [];
+		if (headers.length > 0) {
+			lines.push("    headers:");
+			for (const [k, v] of headers) {
+				lines.push(`      ${JSON.stringify(k)}: ${JSON.stringify(v)}`);
+			}
+		}
+	}
+	return lines.join("\n");
+}
+
+function injectAgentMcpServers(md: string, servers: readonly AgentMcpServerSpec[]): string {
+	if (servers.length === 0) return md;
+	const match = /^---\r?\n([\s\S]*?)\r?\n---(\r?\n|$)/.exec(md);
+	if (!match) throw new Error("ACP carrier agent.md is missing YAML frontmatter");
+	const frontmatter = match[1];
+	const suffix = match[2];
+	const rest = md.slice(match[0].length);
+	return `---\n${frontmatter}\n${formatAgentMcpYaml(servers)}\n---${suffix}${rest}`;
+}
+
 export interface StageAgyHomeOptions {
 	geminiHome?: string;
 	parentDir?: string;
@@ -54,7 +86,7 @@ export interface StageAgyHomeOptions {
 	ownBridge?: { pid: number; port: number; token: string; tokenHeader: string };
 	/** Inherit foreign/global MCP entries from global mcp_config.json (default
 	 *  true for stream-json; ACP sets false because session/new and
-	 *  session/load already inject the session's pi-bridge). */
+	 *  session/load plus the private agent frontmatter inject pi-bridge). */
 	inheritGlobalMcp?: boolean;
 	/** Generated carrier agent name for ACP restricted sessions. Copied into
 	 *  <staged>/config/agents/<agent>/agent.md as a real directory (never
@@ -64,6 +96,11 @@ export interface StageAgyHomeOptions {
 	/** Explicit agent discovery root for tests; falls back to AGY_AGENTS_ROOT
 	 *  then geminiHome/config/agents. */
 	agentsRoot?: string;
+	/** Session MCP server specs injected as `mcpServers` list-of-objects into
+	 *  the PRIVATE copied carrier frontmatter so bridge access is part of the
+	 *  custom Agent definition at creation time without writing secrets to the
+	 *  global agent file. */
+	agentMcpServers?: AgentMcpServerSpec[];
 }
 
 /** Isolate a spawned agy from per-pid bridge entries in the global MCP
@@ -140,7 +177,11 @@ export function stageAgyHome(opts: StageAgyHomeOptions = {}): string {
 		if (opts.agent && carrierMd) {
 			const targetDir = path.join(staged, "config", "agents", opts.agent);
 			fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
-			fs.writeFileSync(path.join(targetDir, "agent.md"), fs.readFileSync(carrierMd), { mode: 0o600 });
+			const rawAgentMd = fs.readFileSync(carrierMd, "utf8");
+			const privateAgentMd = opts.agentMcpServers?.length
+				? injectAgentMcpServers(rawAgentMd, opts.agentMcpServers)
+				: rawAgentMd;
+			fs.writeFileSync(path.join(targetDir, "agent.md"), privateAgentMd, { mode: 0o600 });
 		}
 		return staged;
 	} catch (err) {

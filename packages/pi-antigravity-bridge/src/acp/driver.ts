@@ -3,8 +3,9 @@
 // the G9 round-trip store work unchanged.
 //
 // Engine differences vs stream-json, all verified live (docs/ACP-PROTOCOL-REFERENCE.md):
-//   - no process recycle on profile drift: one server process, sessions
-//     selected per turn via session/new / session/load
+//   - no process recycle on model/mode/effort/cwd drift: one server process,
+//     sessions selected per turn via session/new / session/load; only a
+//     changed request.agent recycles the process (before creating the next turn)
 //   - model and thought_level are separate session/set_config_option calls
 //   - config does NOT persist across server restarts: re-applied every turn
 //   - session/load replays history as full-text notification pairs BEFORE its

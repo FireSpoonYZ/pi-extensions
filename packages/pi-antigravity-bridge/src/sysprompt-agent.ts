@@ -1,4 +1,4 @@
-// G10 delivery for the stream-json engine: staged system-prompt agent.
+// G10 delivery: staged system-prompt and ACP carrier agents.
 //
 // agy's stream-json prompt path silently drops any turn past a ~25KB input
 // cap (probed 2026-09-30, issue #2: status SUCCESS, empty response, zero
@@ -9,18 +9,19 @@
 // under ~/.gemini/config/agents and passed via --agent: the CLI reads agent
 // files from disk, off the prompt line, so the cap never applies.
 //
-// Frontmatter keeps agy's DEFAULTS on purpose (no excludeDefaultComponents,
-// no inheritMcp override): provider sessions need the bridge MCP config for
-// G9 round-trips. Two deliberate exceptions. The tools list: omitting tools
-// reads as "read-only defaults" upstream, not "all tools", which stripped
-// write/edit/command from carrier sessions (issue #13; agy appends the
-// resource/MCP tools itself, so G9 round-trips ride call_mcp_tool
-// regardless). The subagent keys: agent-file presence already suppresses
-// agy's native subagent tools (probed 2026-10-20, issue #7), and declaring
-// it makes the suppression explicit instead of relying on the accident
-// (whether the keys themselves mask, apart from presence, is unattributed).
-// Contrast the ask-tool reviewer agent, which strips everything for
-// sandboxing.
+// Two carrier profiles share this content-addressed staging path:
+//   - Stream-json (default, opts.acp omitted/false): keeps agy's DEFAULTS on
+//     purpose (no excludeDefaultComponents, no inheritMcp override) with the
+//     native tool list and subagent suppression.
+//   - ACP (opts.acp: true): emits a restricted Pi-only carrier agent
+//     (excludeDefaultComponents: true, inheritCustomizations: false, tools: [],
+//     empty skills/rules/agents/hooks/plugins). The staged global file stays
+//     secret-free (no mcpServers URLs or bearer tokens); acp/home.ts injects the
+//     session's live mcpServers list-of-objects only into the private staged home
+//     copy at spawn time. Its body carries Pi's system prompt (when enabled)
+//     plus the bridge protocol and live tool catalog, hashed under an "acp\0"
+//     salt so catalog or prompt changes produce a new agent name and trigger a
+//     safe driver recycle.
 //
 // Lifecycle: one agent dir per DISTINCT body (content-addressed by sha256);
 // two conversations with different system prompts in one process stage two
