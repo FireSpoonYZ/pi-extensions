@@ -1,6 +1,6 @@
 {
   "name": "@firespoon/pi-antigravity-bridge",
-  "version": "1.10.8",
+  "version": "1.10.9",
   "description": "Gemini provider and AskAntigravity tool for Pi on the Antigravity ACP server (restricted custom agent with Pi tools via MCP) or the stream-json agy CLI fallback. Use antigravity/* models in Pi with /model picker support.",
   "keywords": [
     "pi-package",

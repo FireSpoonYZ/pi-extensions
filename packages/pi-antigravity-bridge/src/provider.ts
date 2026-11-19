@@ -171,13 +171,16 @@ export const SYSTEM_PROMPT_PREAMBLE =
 export const SYSTEM_PROMPT_END = "[END SYSTEM PROMPT]";
 
 const PI_DEFAULT_IDENTITY_RE = /^You are a coding assistant running inside pi, a coding agent harness\./;
+const PI_DOCS_BLOCK_RE = /^<docs>\r?\n[\s\S]*?^<\/docs>\r?$/m;
+const PI_CODEMODE_DOCS_ITEM =
+	", codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)";
 
-/** Replace Pi's exact leading default identity sentence with neutral wording
- *  when present; sending the unmodified leading sentence triggers repeated
- *  RESOURCE_EXHAUSTED 429 responses on agy. Preserves all subsequent text and
- *  leaves custom prompts untouched. */
+/** Adapt the two default prompt fragments that can trigger agy's generic 429.
+ *  The docs edit stays inside <docs>; tool declarations are not changed. */
 function adaptPiSystemPrompt(systemPrompt: string): string {
-	return systemPrompt.replace(PI_DEFAULT_IDENTITY_RE, "You are a coding assistant.");
+	return systemPrompt
+		.replace(PI_DEFAULT_IDENTITY_RE, "You are a coding assistant.")
+		.replace(PI_DOCS_BLOCK_RE, (docs) => docs.replace(PI_CODEMODE_DOCS_ITEM, ""));
 }
 
 /** Brief tool-priority note appended inside every system prompt block: agy

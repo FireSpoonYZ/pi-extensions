@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.10.9] - 2026-11-19
+
+### Fixed
+
+- Omit Pi's `codemode` documentation-index entry from the system prompt sent to `agy`, where it can trigger `RESOURCE_EXHAUSTED` (429). This applies to ACP and stream-json and leaves the `codemode` tool, the MCP tool catalog, and other prompt content unchanged.
+
 ## [1.10.8] - 2026-11-15
 
 ### Fixed

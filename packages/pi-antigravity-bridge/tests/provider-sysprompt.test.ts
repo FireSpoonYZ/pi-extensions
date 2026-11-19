@@ -123,7 +123,7 @@ interface Harness {
 	dir: string;
 }
 
-function gateHarness(): Harness {
+function gateHarness(engine: "stream-json" | "acp" = "stream-json"): Harness {
 	const seen: { opts?: DriverTurnRequest } = {};
 	const driver: StreamDriver = {
 		run: async (opts: DriverTurnRequest) => {
@@ -148,6 +148,9 @@ function gateHarness(): Harness {
 		entries: [{ id: "gemini-flash", full: "gemini-3.6-flash" }],
 		store: new SessionStore(path.join(dir, "sessions.json")),
 		driver,
+		engine,
+		acpDriver: engine === "acp" ? driver : undefined,
+		bridgeCatalog: () => [{ name: "codemode", description: "Run JavaScript", inputSchema: { type: "object" } }],
 		roundTrips: new ToolRoundTrips(driver),
 	});
 	return { seen, streamSimple, dir };
@@ -192,6 +195,37 @@ test("gate: fresh conversation stages the system prompt as an agent, not prompt 
 			const md = fs.readFileSync(path.join(root, agent, "agent.md"), "utf8");
 			assert.ok(md.includes(SYS));
 			assert.ok(md.includes(TOOL_PRIORITY_NOTE));
+		} finally {
+			fs.rmSync(h.dir, { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+test.each(["acp", "stream-json"] as const)("gate: %s carrier omits only Pi's codemode docs item", async (engine) => {
+	const codemodeDocs = "codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)";
+	const topics = "- When asked about: MCP servers (docs/mcp.md)";
+	const eol = engine === "acp" ? "\n" : "\r\n";
+	const projectContext = ["<project_context>", `Preserve this reference, ${codemodeDocs}`, "</project_context>"].join(eol);
+	const sys = [
+		"You are a coding assistant running inside pi, a coding agent harness.",
+		"<docs>",
+		`${topics}, ${codemodeDocs}`,
+		"</docs>",
+		projectContext,
+	].join(eol);
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-gate-agents-"));
+	await withEnv({ AGY_SYSTEM_PROMPT: "on", AGY_AGENT: undefined, AGY_AGENTS_ROOT: root }, async () => {
+		resetSyspromptAgentForTests();
+		const h = gateHarness(engine);
+		try {
+			await runTurn(h, "hello", sys);
+			const agent = h.seen.opts?.agent ?? "";
+			assert.ok(agent.startsWith("pi-bridge-sys-"));
+			const md = fs.readFileSync(path.join(root, agent, "agent.md"), "utf8");
+			assert.ok(md.includes(["You are a coding assistant.", "<docs>", topics, "</docs>"].join(eol)));
+			assert.ok(md.includes(projectContext));
+			if (engine === "acp") assert.ok(md.includes("### codemode\n"));
 		} finally {
 			fs.rmSync(h.dir, { recursive: true, force: true });
 			fs.rmSync(root, { recursive: true, force: true });
