@@ -97,6 +97,11 @@ interface ActiveTurn {
 	 *  output frame. tool-only inferences keep it open and merge into the
 	 *  previous batch: the divisor shrinks, the total over-reads (safe). */
 	toolBatchOpen: boolean;
+	/** External MCP bridge_call round-trips injected into this turn. Tracked
+	 *  separately from toolBatches so native tool_call + bridge_call pairs do
+	 *  not double-count the #derivedContextTokens divisor while still marking
+	 *  bridge-only tool round-trips as multi-inference for Pi usage reporting. */
+	bridgeCalls: number;
 	/** Last usage_update occupancy this turn. Authoritative over every
 	 *  derived total; native agy 1.5.4 never sends it (probe 2026-11-10). */
 	contextUsed: number | undefined;
@@ -174,6 +179,7 @@ export class AcpDriver implements TurnDriver {
 		if (!t || t.closed) return;
 		if (activity.type === "bridge_call") {
 			t.parks += 1;
+			t.bridgeCalls += 1;
 			this.#clearIdle(t);
 			this.#pauseOverall(t);
 		}
@@ -376,11 +382,13 @@ export class AcpDriver implements TurnDriver {
 			turn.sawResult = true;
 			// Exact PromptResponse.usage supersedes every partial estimate, but
 			// its total is a billing sum over all inferences, not context (see
-			// #derivedContextTokens): correct it before it reaches pi's gauge.
+			// #derivedContextTokens): correct it before it reaches pi's gauge,
+			// and keep cumulative per-prompt billing splits out of Pi's
+			// AssistantMessage.usage (Pi's overflow check sums input + cacheRead).
 			let settleUsage: AgyUsage | undefined;
 			if (result.usage) {
 				settleUsage = this.#contextCorrectedUsage(turn, result.usage);
-				this.#emit(turn, { type: "usage", usage: settleUsage });
+				this.#emit(turn, { type: "usage", usage: this.#piUsageActivity(turn, settleUsage) });
 			}
 			const mapped = mapStopReason(result.stopReason);
 			this.#settle(turn, {
@@ -673,6 +681,7 @@ export class AcpDriver implements TurnDriver {
 			estimatedInputTokens: estimateTokens(request.contextBlock?.text ? `${request.prompt}\n${request.contextBlock.text}` : request.prompt),
 			toolBatches: 0,
 			toolBatchOpen: false,
+			bridgeCalls: 0,
 			contextUsed: undefined,
 			sawResult: false,
 			promptStarted: false,
@@ -867,6 +876,39 @@ export class AcpDriver implements TurnDriver {
 	 *  in AGENTS.md). */
 	#contextCorrectedUsage(turn: ActiveTurn, usage: AgyUsage): AgyUsage {
 		return { ...usage, total_tokens: turn.contextUsed ?? this.#derivedContextTokens(turn, usage) };
+	}
+
+	/** Shape the final usage activity emitted to Pi (shared toPiUsage).
+	 *  TurnOutcome.usage keeps the full PromptResponse.usage billing fields
+	 *  plus the corrected context total; Pi's AssistantMessage.usage models a
+	 *  single reply and Pi's overflow check sums input + cacheRead against
+	 *  contextWindow. For confirmed multi-inference turns (native tool batches
+	 *  or external bridge_call round-trips) or frames whose input + cacheRead
+	 *  exceeds observed usage_update occupancy, ACP has no per-inference split:
+	 *  emit only the explainable total_tokens and explicitly zero input/output/
+	 *  cache_read so prior estimates/residue are cleared and cumulative billing
+	 *  cannot trigger false overflow compaction. Single non-contradictory
+	 *  responses keep their counts, with missing cache_read_tokens cleared to 0. */
+	#piUsageActivity(turn: ActiveTurn, corrected: AgyUsage): AgyUsage {
+		const input = corrected.input_tokens ?? 0;
+		const output = corrected.output_tokens ?? 0;
+		const cacheRead = corrected.cache_read_tokens ?? 0;
+		const multiInference = turn.toolBatches > 0 || turn.bridgeCalls > 0;
+		const exceedsOccupancy = turn.contextUsed !== undefined && input + cacheRead > turn.contextUsed;
+		if (multiInference || exceedsOccupancy) {
+			return {
+				input_tokens: 0,
+				output_tokens: 0,
+				cache_read_tokens: 0,
+				total_tokens: corrected.total_tokens,
+			};
+		}
+		return {
+			...corrected,
+			input_tokens: input,
+			output_tokens: output,
+			cache_read_tokens: cacheRead,
+		};
 	}
 
 	/** PromptResponse.usage sums input+cacheRead+output over EVERY inference

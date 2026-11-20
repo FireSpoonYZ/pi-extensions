@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Prevent false context-overflow compaction from cumulative ACP `PromptResponse.usage`.** For multi-inference ACP turns (native `tool_call` batches or external `bridge_call` round-trips) and frames whose cumulative `input + cacheRead` exceeds observed `usage_update` occupancy, `AcpDriver` now emits only the explainable context `total_tokens` in the final Pi `usage` activity with `input_tokens`, `output_tokens`, and `cache_read_tokens` explicitly set to `0` (clearing prior estimates/residue so cumulative billing cannot trip Pi's `input + cacheRead > contextWindow` overflow check). Single-inference non-contradictory ACP replies keep their exact `input`/`output`/`cacheRead` counts (clearing omitted `cache_read_tokens` to `0`), `TurnOutcome.usage` keeps its existing contract, and `/session` displays `0` for `in`/`out`/`cache` on multi-inference ACP replies to indicate the protocol does not report a per-inference split.
+
 ## [1.10.9] - 2026-11-19
 
 ### Fixed

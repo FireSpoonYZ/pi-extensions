@@ -44,6 +44,16 @@
 //                      the Gate B synthesis)
 //   usage-occ-once     prompt 1 -> usage_update + aggregate; prompt 2 ->
 //                      aggregate only (per-turn occupancy must not leak)
+//   usage-115-tools    115 tool batches + usage_update (154663) + cumulative
+//                      PromptResponse.usage exceeding 1M (incident reproducer)
+//   usage-115-tools-no-occ  same 115 tool batches + cumulative billing WITHOUT
+//                      usage_update (missing occupancy fallback)
+//   usage-contradictory no tool_call frames, usage_update (154663) + billing
+//                      where input + cacheRead exceeds observed occupancy
+//   usage-high-occ     1 tool batch + high usage_update (920000) + cumulative
+//                      billing > 1M (high occupancy totalTokens preserved)
+//   usage-single-nocache single inference WITH PromptResponse.usage omitting
+//                      cachedReadTokens (Pi usage clears cache_read_tokens=0)
 
 import fs from "node:fs";
 import readline from "node:readline";
@@ -444,6 +454,41 @@ async function streamPrompt() {
     notifyChunk("DONE");
     if (pendingPromptId !== null) {
       result(pendingPromptId, { stopReason: "end_turn", ...(scenario === "usage-occ-only" ? {} : { usage }) });
+      pendingPromptId = null;
+    }
+    streaming = false;
+    return;
+  }
+  if (
+    scenario === "usage-115-tools" ||
+    scenario === "usage-115-tools-no-occ" ||
+    scenario === "usage-contradictory" ||
+    scenario === "usage-high-occ" ||
+    scenario === "usage-single-nocache"
+  ) {
+    if (scenario === "usage-115-tools" || scenario === "usage-115-tools-no-occ") {
+      for (let i = 0; i < 115; i += 1) {
+        const id = `t${i}`;
+        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { toolCallId: id, title: "Run run_command?", kind: "execute", status: "pending", rawInput: { CommandLine: "echo x" }, sessionUpdate: "tool_call" } } });
+        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { toolCallId: id, status: "completed", rawOutput: "x", sessionUpdate: "tool_call_update" } } });
+        notifyThoughtChunk(`step ${i}`);
+      }
+    } else if (scenario === "usage-high-occ") {
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { toolCallId: "h1", title: "Run run_command?", kind: "execute", status: "pending", rawInput: { CommandLine: "echo x" }, sessionUpdate: "tool_call" } } });
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { toolCallId: "h1", status: "completed", rawOutput: "x", sessionUpdate: "tool_call_update" } } });
+    }
+    if (scenario === "usage-115-tools" || scenario === "usage-contradictory") {
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "usage_update", used: 154663, size: 1000000 } } });
+    } else if (scenario === "usage-high-occ") {
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "usage_update", used: 920000, size: 1000000 } } });
+    }
+    const usage =
+      scenario === "usage-single-nocache"
+        ? { inputTokens: 1000, outputTokens: 50, totalTokens: 1050 }
+        : { inputTokens: 385247, outputTokens: 44885, cachedReadTokens: 13077259, totalTokens: 13507391 };
+    notifyChunk("DONE");
+    if (pendingPromptId !== null) {
+      result(pendingPromptId, { stopReason: "end_turn", usage });
       pendingPromptId = null;
     }
     streaming = false;

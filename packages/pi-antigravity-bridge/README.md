@@ -36,6 +36,7 @@ Residual limits:
 - On **acp** with `bridgeTools: "none"` (or `"mcp"` without adapter tools), no Pi workspace file/shell/extension tools are bridged (leaving only agy's retained foundational runtime tools under `none`, or `pi-mcp-adapter` tools + skills under `mcp`).
 - On **stream-json** (where agy's native workspace tools remain active), agy's own edits land directly on disk without pi's inline diff review, and agy commands run without per-action approval by default unless the [Approval gate](docs/APPROVAL-GATE.md) is enabled (`auto` turns it on only when a pi permission extension is installed). See also [Permissions](#permissions) below.
 - No cost accounting: cost stays zero because agy runs on your subscription quota. Token usage is live.
+- On **acp**, `PromptResponse.usage` aggregates billing tokens across every inference in a prompt without a per-inference split. For multi-inference ACP replies (turns with tool calls or MCP bridge round-trips) or frames whose cumulative `input + cacheRead` exceeds observed `usage_update` occupancy, the bridge reports only the context `totalTokens` to Pi and sets `input`/`output`/`cacheRead` to `0`, so `/session` displays `0` for `in`/`out`/`cache` on those replies (meaning unknown / not split by the protocol) while preserving context occupancy and avoiding false context-overflow compaction. Single-inference non-contradictory ACP replies still report their exact `in`/`out`/`cache` counts.
 
 ## MCP tool bridge (agy uses pi's tools)
 

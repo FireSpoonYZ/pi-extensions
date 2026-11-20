@@ -8,9 +8,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isContextOverflow, type Api, type AssistantMessage } from "@earendil-works/pi-ai";
 import { AcpDriver } from "../src/acp/driver.js";
 import type { AcpPermissionHandler } from "../src/acp/connection.js";
 import type { DriverActivity } from "../src/driver-types.js";
+import { toPiUsage } from "../src/stream-events.js";
 
 const FAKE_SERVER = fileURLToPath(new URL("./helpers/fake-acp-server.mjs", import.meta.url));
 const SESSION_ID = "fake-session-0001";
@@ -825,6 +827,33 @@ describe("acp/driver usage synthesis (Gate B stopgap)", () => {
 	});
 });
 
+function applyUsageActivities(
+	activities: DriverActivity[],
+	initial?: Partial<AssistantMessage["usage"]>,
+): AssistantMessage {
+	const msg: AssistantMessage = {
+		role: "assistant",
+		content: [],
+		api: "agy-bridge" as Api,
+		provider: "antigravity",
+		model: "gemini-3.8-flash",
+		usage: {
+			input: initial?.input ?? 0,
+			output: initial?.output ?? 0,
+			cacheRead: initial?.cacheRead ?? 0,
+			cacheWrite: initial?.cacheWrite ?? 0,
+			totalTokens: initial?.totalTokens ?? 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+	for (const a of activities) {
+		if (a.type === "usage") toPiUsage(a.usage, msg.usage);
+	}
+	return msg;
+}
+
 describe("acp/driver exact-usage context total (issue #12)", () => {
 	test("single-inference aggregate passes through (n=1 is exact)", async () => {
 		const run = await tracked("usage-single", { prompt: "hi" });
@@ -838,13 +867,26 @@ describe("acp/driver exact-usage context total (issue #12)", () => {
 		});
 		const usage = run.activities.filter((a) => a.type === "usage").at(-1);
 		assert.ok(usage && usage.type === "usage");
-		assert.equal(usage.usage.total_tokens, 1850);
+		assert.deepEqual(usage.usage, {
+			input_tokens: 1000,
+			output_tokens: 50,
+			cache_read_tokens: 800,
+			total_tokens: 1850,
+		});
+		const msg = applyUsageActivities(run.activities);
+		assert.equal(msg.usage.input, 1000);
+		assert.equal(msg.usage.output, 50);
+		assert.equal(msg.usage.cacheRead, 800);
+		assert.equal(msg.usage.totalTokens, 1850);
+		assert.equal(isContextOverflow(msg, 1_000_000), false);
 	});
 
 	test("multi-step aggregate is de-quadratized by the tool round-trip count", async () => {
 		// Σin 1000 + Σout 50 + ceil(ΣcacheRead 800 / (1 tool call + 1) = 2 = 400).
 		// The raw 1850 would double the true occupancy; pi reads totalTokens as
-		// context length (issue #12: 107% gauge at 10% real).
+		// context length (issue #12: 107% gauge at 10% real). Pi's usage activity
+		// zeroes cumulative input/output/cacheRead so per-prompt billing cannot
+		// masquerade as a single inference's prompt size.
 		const run = await tracked("usage-total", { prompt: "hi" });
 		const outcome = await run.handle.outcome;
 		assert.equal(outcome.status, "OK");
@@ -856,7 +898,12 @@ describe("acp/driver exact-usage context total (issue #12)", () => {
 		});
 		const usage = run.activities.filter((a) => a.type === "usage").at(-1);
 		assert.ok(usage && usage.type === "usage");
-		assert.equal(usage.usage.total_tokens, 1450);
+		assert.deepEqual(usage.usage, {
+			input_tokens: 0,
+			output_tokens: 0,
+			cache_read_tokens: 0,
+			total_tokens: 1450,
+		});
 	});
 
 	test("usage_update occupancy overrides the aggregate when the server sends it", async () => {
@@ -877,6 +924,15 @@ describe("acp/driver exact-usage context total (issue #12)", () => {
 		for (const a of run.activities.slice(firstLive)) {
 			if (a.type === "usage") assert.equal(a.usage.total_tokens, 42000);
 		}
+		// Single non-contradictory inference (1000 + 800 <= 42000) preserves its split.
+		const finalUsage = run.activities.filter((a) => a.type === "usage").at(-1);
+		assert.ok(finalUsage && finalUsage.type === "usage");
+		assert.deepEqual(finalUsage.usage, {
+			input_tokens: 1000,
+			output_tokens: 50,
+			cache_read_tokens: 800,
+			total_tokens: 42000,
+		});
 	});
 
 	test("parallel tool calls are one inference batch, not one step each", async () => {
@@ -947,5 +1003,174 @@ describe("acp/driver exact-usage context total (issue #12)", () => {
 		// Turn 2 carries no occupancy: the derived path (n=1 raw aggregate),
 		// never turn 1's stale 42000.
 		assert.equal(outcome.usage?.total_tokens, 1850);
+	});
+
+	test("115-tool-turn cumulative billing over 1M window keeps low occupancy and avoids false Pi overflow", async () => {
+		const run = await tracked("usage-115-tools", { prompt: "hi" });
+		const outcome = await run.handle.outcome;
+		assert.equal(outcome.status, "OK");
+		assert.deepEqual(outcome.usage, {
+			input_tokens: 385247,
+			output_tokens: 44885,
+			cache_read_tokens: 13077259,
+			total_tokens: 154663,
+		});
+		const finalUsage = run.activities.filter((a) => a.type === "usage").at(-1);
+		assert.ok(finalUsage && finalUsage.type === "usage");
+		assert.deepEqual(finalUsage.usage, {
+			input_tokens: 0,
+			output_tokens: 0,
+			cache_read_tokens: 0,
+			total_tokens: 154663,
+		});
+		const msg = applyUsageActivities(run.activities);
+		assert.deepEqual(msg.usage, {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 154663,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		assert.equal(isContextOverflow(msg, 1_000_000), false);
+		// Sanity check: emitting raw TurnOutcome.usage would trip Pi 1.5.2 overflow.
+		assert.ok(outcome.usage);
+		const unadapted = applyUsageActivities([{ type: "usage", usage: outcome.usage }]);
+		assert.equal(isContextOverflow(unadapted, 1_000_000), true);
+	});
+
+	test("115-tool-turn without usage_update uses derived total and avoids false Pi overflow", async () => {
+		const run = await tracked("usage-115-tools-no-occ", { prompt: "hi" });
+		const outcome = await run.handle.outcome;
+		assert.equal(outcome.status, "OK");
+		const expectedDerived = 385247 + 44885 + Math.ceil(13077259 / 116);
+		assert.deepEqual(outcome.usage, {
+			input_tokens: 385247,
+			output_tokens: 44885,
+			cache_read_tokens: 13077259,
+			total_tokens: expectedDerived,
+		});
+		const finalUsage = run.activities.filter((a) => a.type === "usage").at(-1);
+		assert.ok(finalUsage && finalUsage.type === "usage");
+		assert.deepEqual(finalUsage.usage, {
+			input_tokens: 0,
+			output_tokens: 0,
+			cache_read_tokens: 0,
+			total_tokens: expectedDerived,
+		});
+		const msg = applyUsageActivities(run.activities);
+		assert.equal(msg.usage.input, 0);
+		assert.equal(msg.usage.output, 0);
+		assert.equal(msg.usage.cacheRead, 0);
+		assert.equal(msg.usage.totalTokens, expectedDerived);
+		assert.equal(isContextOverflow(msg, 1_000_000), false);
+	});
+
+	test("external bridge_call-only round-trip zeroes Pi split while preserving outcome contract", async () => {
+		const run = await tracked("usage-single", {
+			prompt: "hi",
+			onHandle: (handle, driver) => {
+				handle.pushExternal({ type: "bridge_call", callId: "b1", name: "read", args: {} });
+				driver.kickIdle();
+			},
+		});
+		const outcome = await run.handle.outcome;
+		assert.equal(outcome.status, "OK");
+		assert.deepEqual(outcome.usage, {
+			input_tokens: 1000,
+			output_tokens: 50,
+			cache_read_tokens: 800,
+			total_tokens: 1850,
+		});
+		const finalUsage = run.activities.filter((a) => a.type === "usage").at(-1);
+		assert.ok(finalUsage && finalUsage.type === "usage");
+		assert.deepEqual(finalUsage.usage, {
+			input_tokens: 0,
+			output_tokens: 0,
+			cache_read_tokens: 0,
+			total_tokens: 1850,
+		});
+		const msg = applyUsageActivities(run.activities);
+		assert.equal(msg.usage.input, 0);
+		assert.equal(msg.usage.output, 0);
+		assert.equal(msg.usage.cacheRead, 0);
+		assert.equal(msg.usage.totalTokens, 1850);
+	});
+
+	test("contradictory frame (input + cacheRead > usage_update) zeroes Pi split even without tool frames", async () => {
+		const run = await tracked("usage-contradictory", { prompt: "hi" });
+		const outcome = await run.handle.outcome;
+		assert.equal(outcome.status, "OK");
+		assert.deepEqual(outcome.usage, {
+			input_tokens: 385247,
+			output_tokens: 44885,
+			cache_read_tokens: 13077259,
+			total_tokens: 154663,
+		});
+		const finalUsage = run.activities.filter((a) => a.type === "usage").at(-1);
+		assert.ok(finalUsage && finalUsage.type === "usage");
+		assert.deepEqual(finalUsage.usage, {
+			input_tokens: 0,
+			output_tokens: 0,
+			cache_read_tokens: 0,
+			total_tokens: 154663,
+		});
+		const msg = applyUsageActivities(run.activities);
+		assert.equal(msg.usage.input, 0);
+		assert.equal(msg.usage.output, 0);
+		assert.equal(msg.usage.cacheRead, 0);
+		assert.equal(msg.usage.totalTokens, 154663);
+		assert.equal(isContextOverflow(msg, 1_000_000), false);
+	});
+
+	test("high occupancy totalTokens is preserved on multi-inference turns while avoiding false overflow", async () => {
+		const run = await tracked("usage-high-occ", { prompt: "hi" });
+		const outcome = await run.handle.outcome;
+		assert.equal(outcome.status, "OK");
+		assert.deepEqual(outcome.usage, {
+			input_tokens: 385247,
+			output_tokens: 44885,
+			cache_read_tokens: 13077259,
+			total_tokens: 920000,
+		});
+		const finalUsage = run.activities.filter((a) => a.type === "usage").at(-1);
+		assert.ok(finalUsage && finalUsage.type === "usage");
+		assert.deepEqual(finalUsage.usage, {
+			input_tokens: 0,
+			output_tokens: 0,
+			cache_read_tokens: 0,
+			total_tokens: 920000,
+		});
+		const msg = applyUsageActivities(run.activities);
+		assert.equal(msg.usage.input, 0);
+		assert.equal(msg.usage.output, 0);
+		assert.equal(msg.usage.cacheRead, 0);
+		assert.equal(msg.usage.totalTokens, 920000);
+		assert.equal(isContextOverflow(msg, 1_000_000), false);
+	});
+
+	test("single non-contradictory response without cachedReadTokens explicitly clears prior cacheRead to 0", async () => {
+		const run = await tracked("usage-single-nocache", { prompt: "hi" });
+		const outcome = await run.handle.outcome;
+		assert.equal(outcome.status, "OK");
+		assert.deepEqual(outcome.usage, {
+			input_tokens: 1000,
+			output_tokens: 50,
+			total_tokens: 1050,
+		});
+		const finalUsage = run.activities.filter((a) => a.type === "usage").at(-1);
+		assert.ok(finalUsage && finalUsage.type === "usage");
+		assert.deepEqual(finalUsage.usage, {
+			input_tokens: 1000,
+			output_tokens: 50,
+			cache_read_tokens: 0,
+			total_tokens: 1050,
+		});
+		const msg = applyUsageActivities(run.activities, { cacheRead: 999_999 });
+		assert.equal(msg.usage.input, 1000);
+		assert.equal(msg.usage.output, 50);
+		assert.equal(msg.usage.cacheRead, 0);
+		assert.equal(msg.usage.totalTokens, 1050);
+		assert.equal(isContextOverflow(msg, 1_000_000), false);
 	});
 });
