@@ -951,6 +951,12 @@ export class AcpDriver implements TurnDriver {
 
 	async close(reason: "recycle" | "shutdown", cause?: string): Promise<void> {
 		this.#log(`close:${reason}${cause ? `:${cause}` : ""}`);
+		const conn = this.#conn;
+		// Detach before waiting so this connection's exit cannot affect a
+		// replacement started while its private resources are being cleaned up.
+		this.#conn = undefined;
+		this.#connAgent = undefined;
+		this.#state = "dead";
 		const turn = this.#active;
 		if (turn && !turn.closed) {
 			this.#settle(turn, {
@@ -962,11 +968,8 @@ export class AcpDriver implements TurnDriver {
 				aborted: false,
 			});
 		}
-		this.#conn?.abortAll(`driver ${reason}`);
-		this.#conn?.kill();
-		this.#conn = undefined;
-		this.#connAgent = undefined;
-		this.#state = "dead";
+		conn?.abortAll(`driver ${reason}`);
+		await conn?.close();
 	}
 
 	snapshot(): DriverSnapshot {

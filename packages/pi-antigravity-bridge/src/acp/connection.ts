@@ -124,6 +124,10 @@ export class AcpConnection {
 	#exactUsageSeen = false;
 	#exited = false;
 	#killed = false;
+	#resolveFinished!: () => void;
+	#finished = new Promise<void>((resolve) => {
+		this.#resolveFinished = resolve;
+	});
 	#suppressUpdates = false;
 	#updateSessionId: string | null = null;
 	agentInfo: Record<string, unknown> | undefined;
@@ -620,6 +624,12 @@ export class AcpConnection {
 		}
 	}
 
+	/** Explicit shutdown waits for the process exit and private home cleanup. */
+	close(): Promise<void> {
+		this.kill();
+		return this.#finished;
+	}
+
 	#finish(reason: string, code: number | null = null, signal: NodeJS.Signals | null = null): void {
 		if (this.#exited) return;
 		this.#exited = true;
@@ -631,6 +641,7 @@ export class AcpConnection {
 		this.abortAll(`connection exited: ${reason || "process gone"}`);
 		this.#releaseRecallHook();
 		this.#releaseHome();
+		this.#resolveFinished();
 		this.#opts.onExit({ code, signal, stderrTail: redactText(this.#stderrTail) });
 	}
 
