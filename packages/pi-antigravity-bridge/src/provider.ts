@@ -47,6 +47,8 @@ import path from "node:path";
 import { TurnDiffContext, createExecGitOps, formatInlineDiff, parseEditToolInput } from "./diff-render.js";
 import { stageSyspromptAgent } from "./sysprompt-agent.js";
 import { buildImageNote, stagePromptImages } from "./prompt-images.js";
+import type { ProjectHindsightRecall } from "./hindsight-recall.js";
+import { MAX_FRAME_BYTES } from "./frame-guard.js";
 
 const DEFAULT_TIMEOUT_MIN = 10;
 
@@ -152,6 +154,9 @@ export const RESUME_PROMPT =
 
 export const DIGEST_PREAMBLE =
 	"[The following is context from the broader pi session that this Antigravity turn was not directly spawned for: compaction summaries and turns handled by other providers or pi's own tools. Your own prior turns are already in your conversation history. Use this for continuity only.]";
+
+const ACP_SESSION_HISTORY_PREAMBLE =
+	"[The following is the available history from this Pi session before the current request. Use it for continuity with the current user message and avoid repeating completed actions.]";
 
 // --- pi system prompt (G10) ----------------------------------------------------
 //
@@ -300,6 +305,10 @@ export interface DigestOptions {
 	/** Provider id whose assistant turns are already in agy's own DB and so
 	 *  must be skipped to avoid double-counting. Default "antigravity". */
 	ownProvider?: string;
+	/** Include the bridge's earlier assistant replies in a new conversation. */
+	includeOwn?: boolean;
+	/** Include the last supplied message when the caller passes only history. */
+	includeLast?: boolean;
 	/** Soft cap on the digest body (0 = unbounded). Default 8000. */
 	maxChars?: number;
 }
@@ -341,15 +350,15 @@ export function buildContextDigest(
 		}
 	}
 
-	// 2. Delta since the watermark, excluding the trailing current prompt.
+	// 2. Delta since the watermark, normally excluding the trailing prompt.
 	//    Clamp start to just after the compaction summary when one is present.
 	let start = Math.max(0, Math.floor(watermark));
 	if (lastCompactionIdx >= 0) start = Math.max(start, lastCompactionIdx + 1);
-	const end = Math.max(0, messages.length - 1);
+	const end = opts.includeLast ? messages.length : Math.max(0, messages.length - 1);
 	for (let i = start; i < end; i++) {
 		const m = messages[i];
 		if (m.role === "assistant") {
-			if (m.provider === own) continue; // our own turn: already in agy's DB
+			if (!opts.includeOwn && m.provider === own) continue; // our own turn: already in agy's DB
 			const t = blocksToText(m.content).trim();
 			if (!t) continue;
 			deltaParts.push(`[assistant turn from ${m.provider}]\n${t}`);
@@ -420,14 +429,13 @@ function sessionKey(
 	options: SimpleStreamOptions | undefined,
 	cwd: string,
 	engine: "stream-json" | "acp",
+	recallSessions = false,
 ): string {
 	const sid = (options as { sessionId?: string } | undefined)?.sessionId;
 	const base = sid && sid.length > 0 ? `sid:${sid}` : `cwd:${cwd}`;
-	// Engine-scoped keys (plan 9.4): one ACP turn must never touch the stream
-	// binding and vice versa. ACP uses a versioned suffix (@acp-v2) so legacy
-	// @acp conversations retain their stored entries without resuming into the
-	// Pi-only restricted agent profile. Un-suffixed keys = stream-json.
-	return base + (engine === "acp" ? "@acp-v2" : "");
+	// ACP v3 binds sessions created with the recall hook. The v2 key still
+	// identifies the restricted ACP profile used before that hook shipped.
+	return engine === "acp" ? base + (recallSessions ? "@acp-v3" : "@acp-v2") : base;
 }
 
 /** Track which content block is currently open so we close-on-switch.
@@ -485,6 +493,8 @@ export interface StreamSimpleDeps {
 	/** Live Pi bridge tool catalog (incl. activate_skill and bridge_poll_result)
 	 *  wired from the extension's listTools closure for ACP agent prompts. */
 	bridgeCatalog?: () => BridgeCatalogEntry[];
+	/** Request-local Hindsight recall handoff from Pi's context hooks. */
+	projectHindsightRecall?: ProjectHindsightRecall;
 	/** Daily file log sink (src/daily-log.ts). Records pre-dispatch turn
 	 *  errors that never create a driver turn (and so never reach onTurnEnd). */
 	log?: (event: string, data?: unknown, level?: "debug" | "info" | "warn" | "error") => void;
@@ -1187,6 +1197,10 @@ export interface DriverDeps {
 	roster?: SubagentRoster;
 	/** Live Pi bridge tool catalog forwarded from StreamSimpleDeps for ACP. */
 	bridgeCatalog?: () => BridgeCatalogEntry[];
+	/** Recall attributed to this Pi request after removing its projected message. */
+	turnRecall?: string;
+	/** Use ACP bindings for conversations created with the recall hook. */
+	recallSessions?: boolean;
 	/** Active engine (config), for engine-scoped session keys. */
 	engine: "stream-json" | "acp";
 	/** Daily file log sink for pre-dispatch errors (see StreamSimpleDeps). */
@@ -1420,8 +1434,17 @@ async function runTurnDriver(
 	const blocks: BlockState = { partial, textIdx: null, thinkingIdx: null, started: false };
 
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-	const key = sessionKey(options, cwd, deps.engine);
-	const existing = store.get(key);
+	const preferredKey = sessionKey(options, cwd, deps.engine, deps.recallSessions);
+	const legacyKey = deps.recallSessions ? sessionKey(options, cwd, deps.engine) : preferredKey;
+	let key = preferredKey;
+	let existing = store.get(key);
+	if (!existing && key !== legacyKey) {
+		const legacy = store.get(legacyKey);
+		if (legacy) {
+			key = legacyKey;
+			existing = legacy;
+		}
+	}
 	const messageCount = context.messages.length;
 	const config = loadConfig();
 
@@ -1517,6 +1540,9 @@ async function runTurnDriver(
 	const effort = entry?.efforts?.length ? toAgyEffort(options?.reasoning, entry.efforts) : undefined;
 
 	let handle: TurnHandle | undefined;
+	let redirectedRecovery = false;
+	const targetsAnotherBinding = (conversationId: string | undefined): boolean =>
+		Boolean(deps.recallSessions && key === preferredKey && conversationId && conversationId !== existing?.conversationId);
 	// Name of the carrier agent staged for THIS turn's fresh conversation, if
 	// any. Recorded into stagedAgentByConversation once the outcome binds the
 	// conversation id, so later gate-closed turns pass the same agent.
@@ -1530,11 +1556,13 @@ async function runTurnDriver(
 	};
 	const active = isContinuation ? deps.driver.reentry() : null;
 	if (active) {
+		if (deps.recallSessions) redirectedRecovery = targetsAnotherBinding(deps.driver.snapshot().conversationId);
 		handle = active;
 	} else {
 		// Dead turn: claim NOW (single-use). A live turn claims after outcome
 		// instead — claiming here would eat the post-outcome recovery.
 		late.push(...collectStranded());
+		redirectedRecovery = targetsAnotherBinding(redeliveryConversation);
 		if (isContinuation && late.length === 0) {
 			if (escalatedNames.length === 0) {
 				deps.log?.("turn-error", { reason: "tool-result-no-active-turn" }, "warn");
@@ -1561,6 +1589,7 @@ async function runTurnDriver(
 		// Fresh pass, or a stranded escalated result being re-delivered.
 		const userPrompt = extractUserPrompt(context);
 		const images = extractImages(context);
+		const turnRecall = userPrompt || images.length > 0 ? deps.turnRecall : undefined;
 		// Resume pass (issue #8): pi's retry dropped the failed attempt from the
 		// projected context, so the transcript ends in a toolResult or assistant
 		// message and there is no user prompt, no pending park, and nothing
@@ -1588,11 +1617,45 @@ async function runTurnDriver(
 			finalize(stream, blocks, "error", "No user message to send to agy.");
 			return;
 		}
+		// session/load keeps an old native session's original hook set. Start a
+		// new bound session only on a real recall turn, after legacy tool work has
+		// settled. v2 stays available if the new prompt cannot be dispatched.
+		const canMigrate = key !== preferredKey && Boolean(turnRecall) && !isContinuation && late.length === 0 &&
+			!deps.driver.activeHandle && deps.roundTrips.pendingIds.length === 0;
+		const legacyTombstones = canMigrate ? new Set(deps.roundTrips.deadIds) : undefined;
+		const awaitingLegacyResult = legacyTombstones?.size && context.messages.some((message) =>
+			message.role === "assistant" && message.content.some((part) => part.type === "toolCall" && legacyTombstones.has(part.id)),
+		);
+		const migrating = canMigrate && !awaitingLegacyResult;
+		let migrationContext: { uri: string; text: string } | undefined;
+		if (migrating) {
+			const history = buildContextDigest(context.messages.slice(0, -1), 0, {
+				includeOwn: true,
+				includeLast: true,
+				maxChars: 0,
+			});
+			if (history) {
+				migrationContext = {
+					uri: `urn:pi-bridge:session-history/${messageCount}`,
+					text: `${ACP_SESSION_HISTORY_PREAMBLE}\n\n${history}`,
+				};
+				// The remaining ACP envelope, resource and image type tags fit in
+				// this reserve. Count JSON escaping and image data against the cap.
+				const frameBytes = Buffer.byteLength(JSON.stringify({ prompt, images, migrationContext })) + 1024 + 32 * images.length;
+				if (frameBytes > MAX_FRAME_BYTES) {
+					deps.log?.("turn-error", { reason: "acp-session-history-too-large", frameBytes, limitBytes: MAX_FRAME_BYTES }, "warn");
+					finalize(stream, blocks, "error", "The Pi history exceeds the ACP frame limit for transferring this session. Compact the Pi session and retry.");
+					return;
+				}
+			}
+			key = preferredKey;
+			existing = null;
+		}
 		const watermark = existing?.lastMessageCount ?? 0;
 		// Late and resume turns re-open the conversation with a synthetic
 		// prompt; the digest would re-send context agy already holds (against a
 		// stale watermark: a failed pass never advances it), so skip it.
-		const digest = config.digest && late.length === 0 && !resume ? buildContextDigest(context.messages, watermark) : "";
+		const digest = !migrating && config.digest && late.length === 0 && !resume ? buildContextDigest(context.messages, watermark) : "";
 		// G1 delivery per engine. stream-json: digest rides inline in the prompt
 		// (the CLI has no context channel). ACP: the server advertises
 		// `embeddedContext`, so the digest ships as a native resource block
@@ -1673,13 +1736,14 @@ async function runTurnDriver(
 				conversationId: redeliveryConversation ?? existing?.conversationId ?? null,
 				prompt: fullPrompt,
 				images: runImages.length > 0 ? runImages : undefined,
+				...(turnRecall === undefined || key !== preferredKey || redirectedRecovery ? {} : { turnRecall }),
 				agent,
-				contextBlock: embeddedDigest
+				contextBlock: migrationContext ?? (embeddedDigest
 					? {
 							uri: `urn:pi-bridge:context-digest/${messageCount}`,
 							text: `${DIGEST_PREAMBLE}\n\n${embeddedDigest}`,
 						}
-					: undefined,
+					: undefined),
 				signal: options?.signal,
 			});
 		} catch (err) {
@@ -1730,7 +1794,7 @@ async function runTurnDriver(
 		// recreated a conversation, so the snapshot id is the real one, and
 		// the staged agent must move with the binding or a stream-json resume
 		// re-runs without its carrier-agent profile.
-		if (!existing) {
+		if (!existing && !redirectedRecovery) {
 			const parkedConv = deps.driver.snapshot().conversationId;
 			if (parkedConv) {
 				store.set(key, { conversationId: parkedConv, lastStepIdx: -1, lastMessageCount: messageCount });
@@ -1761,7 +1825,7 @@ async function runTurnDriver(
 		outcome.modelOutputSeen === false &&
 		Boolean(existing?.conversationId);
 	if (silentDrop || poisonedResume) {
-		if (existing?.conversationId || outcome.conversationId) {
+		if (!redirectedRecovery && (existing?.conversationId || outcome.conversationId)) {
 			store.delete(key);
 			if (outcome.conversationId) stagedAgentByConversation.delete(outcome.conversationId);
 		}
@@ -1830,6 +1894,7 @@ async function runTurnDriver(
 				});
 				if ((await drainTurn(lateHandle)) === "parked") return;
 				outcome = await lateHandle.outcome;
+				redirectedRecovery ||= targetsAnotherBinding(redeliveryConversation);
 			} catch (err) {
 				// Release the claims so the next pass can retry the delivery.
 				for (const l of more) if (l.callId) deps.roundTrips.unclaim(l.callId);
@@ -1841,7 +1906,7 @@ async function runTurnDriver(
 			}
 		}
 	}
-	if (outcome.conversationId) {
+	if (outcome.conversationId && !redirectedRecovery) {
 		// A different id than the stored one means the driver recreated the
 		// conversation under us (ACP session-load fallback, stream-json CLI
 		// dropping a stale --conversation). The recreated conversation has seen
@@ -1965,7 +2030,9 @@ export function createStreamSimple(
 			return stream;
 		}
 		if (selected && roundTrips) {
-			void runTurnDriver(stream, model, context, options, entries, store, {
+			const useAcp = selected === deps.acpDriver;
+			const recall = useAcp ? deps.projectHindsightRecall?.(context, options) : undefined;
+			void runTurnDriver(stream, model, recall?.context ?? context, options, entries, store, {
 				driver: selected,
 				roundTrips,
 				replay: deps.replay,
@@ -1974,11 +2041,13 @@ export function createStreamSimple(
 				onNativeBackground: deps.onNativeBackground,
 				roster: deps.roster,
 				bridgeCatalog: deps.bridgeCatalog,
+				turnRecall: recall?.turnRecall,
+				recallSessions: useAcp && deps.projectHindsightRecall !== undefined,
 				// Record the engine of the driver that will ACTUALLY run: if the
 				// ACP driver is absent, the config switch falls back to stream,
 				// and keying the session as @acp would store a stream
 				// conversationId under the wrong engine scope.
-				engine: selected === deps.acpDriver ? "acp" : "stream-json",
+				engine: useAcp ? "acp" : "stream-json",
 				log: deps.log,
 			});
 		} else {

@@ -16,9 +16,9 @@
 //   - ACP (opts.acp: true): emits a restricted Pi-only carrier agent
 //     (excludeDefaultComponents: true, inheritCustomizations: false, tools: [],
 //     empty skills/rules/agents/hooks/plugins). The staged global file stays
-//     secret-free (no mcpServers URLs or bearer tokens); acp/home.ts injects the
-//     session's live mcpServers list-of-objects only into the private staged home
-//     copy at spawn time. Its body carries Pi's system prompt (when enabled)
+//     secret-free; acp/home.ts adds the live mcpServers and the bridge's
+//     explicit recall hook only to the private copy at spawn time. Its body
+//     carries Pi's system prompt (when enabled)
 //     plus the bridge protocol and live tool catalog, hashed under an "acp\0"
 //     salt so catalog or prompt changes produce a new agent name and trigger a
 //     safe driver recycle.

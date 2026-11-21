@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- On ACP, send automatic Pi Hindsight recall through a turn-scoped AGY hook. Each user turn receives its own retrieval with either digest setting, including across Pi tool calls and session resume. AGY can still record the injected text in its local diagnostic transcripts.
+
 ## [1.10.10] - 2026-11-20
 
 ### Fixed

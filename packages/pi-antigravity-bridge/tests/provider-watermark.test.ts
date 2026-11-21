@@ -30,6 +30,7 @@ import {
 } from "../src/provider.js";
 import { resetSyspromptAgentForTests } from "../src/sysprompt-agent.js";
 import { SessionStore } from "../src/sessions.js";
+import type { ProjectHindsightRecall } from "../src/hindsight-recall.js";
 import type { StreamDriver, DriverTurnRequest } from "../src/driver.js";
 
 const SYS = "You are pi. Follow AGENTS.md.";
@@ -71,7 +72,7 @@ interface Harness {
  *  status/aborted/error to shape failed or aborted turns. */
 type FakeOutcome = string | { conversationId?: string; status?: "OK" | "ERROR" | "UNKNOWN"; aborted?: boolean; error?: string };
 
-function harness(outcomes: FakeOutcome[]): Harness {
+function harness(outcomes: FakeOutcome[], projectHindsightRecall?: ProjectHindsightRecall): Harness {
 	const seen: { opts?: DriverTurnRequest } = {};
 	const driver: StreamDriver = {
 		run: async (opts: DriverTurnRequest) => {
@@ -99,6 +100,7 @@ function harness(outcomes: FakeOutcome[]): Harness {
 		store,
 		driver,
 		roundTrips: new ToolRoundTrips(driver),
+		...(projectHindsightRecall ? { engine: "acp" as const, acpDriver: driver, projectHindsightRecall } : {}),
 	});
 	return { seen, streamSimple, store, storePath: path.join(dir, "sessions.json"), dir };
 }
@@ -308,4 +310,55 @@ test("aborted turn on the same conversation: watermark is not advanced", async (
 			fs.rmSync(h.dir, { recursive: true, force: true });
 		}
 	});
+});
+
+test("an old ACP binding migrates on the first recall and retries without losing the original history", async () => {
+	const recall = "turn-scoped memory, never in the digest";
+	const h = harness([{ status: "ERROR", conversationId: "failed-attempt", error: "fixture error" }, "new-session", "new-session"], (context) => {
+		const messages = context.messages.filter(message => !(message.role === "user" && message.content === recall));
+		if (messages.length !== context.messages.length) return { context: { ...context, messages }, turnRecall: recall };
+	});
+	try {
+		await withEnv({ AGY_DIGEST: "off", AGY_AGENTS_ROOT: h.dir, AGY_SYSTEM_PROMPT: "off" }, async () => {
+			const options = { cwd: h.dir, sessionId: "existing" } as SimpleStreamOptions;
+			const legacy = { conversationId: "original-session", lastStepIdx: -1, lastMessageCount: 2 };
+			const v2 = "sid:existing@acp-v2", v3 = "sid:existing@acp-v3";
+			h.store.set(v2, legacy);
+			const context = normalizeContext({ messages: [
+				user("First real user message"),
+				{ role: "assistant", api: model.api, provider: model.provider, model: model.id,
+					content: [{ type: "text", text: "An earlier AGY answer" }], usage: {
+						input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					}, stopReason: "stop", timestamp: 2 },
+				user(recall), user("Current question"),
+			] });
+			for (let attempt = 0; attempt < 2; attempt++) {
+				await h.streamSimple(model, context, options).result();
+				assert.ok(h.seen.opts);
+				assert.equal(h.seen.opts.conversationId, null);
+				assert.equal(h.seen.opts.turnRecall, recall);
+				assert.equal(h.seen.opts.prompt, "Current question");
+				const history = h.seen.opts.contextBlock?.text;
+				assert.ok(history);
+				assert.ok(history.includes("First real user message"));
+				assert.ok(history.includes("An earlier AGY answer"));
+				assert.ok(!history.includes(recall));
+				assert.ok(!history.includes("Current question"));
+				assert.deepEqual(h.store.get(v2), legacy);
+				if (attempt === 0) assert.equal(h.store.get(v3), null);
+			}
+			await h.streamSimple(model, contextWith(["Next question"]), options).result();
+			assert.equal(h.seen.opts?.conversationId, "new-session");
+			assert.equal(h.seen.opts?.contextBlock, undefined);
+			assert.equal(h.seen.opts?.turnRecall, undefined);
+			await h.store.flush();
+			const reopened = new SessionStore(h.storePath);
+			assert.equal(reopened.get(v3)?.conversationId, "new-session");
+			assert.deepEqual(reopened.get(v2), legacy);
+		});
+	} finally {
+		await h.store.flush();
+		fs.rmSync(h.dir, { recursive: true, force: true });
+	}
 });

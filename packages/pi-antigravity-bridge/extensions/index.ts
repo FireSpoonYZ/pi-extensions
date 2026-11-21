@@ -48,6 +48,7 @@ import {
 	formatPollAnswer,
 	type NativeDisplayEvent,
 } from "../src/provider.js";
+import { registerHindsightRecall } from "../src/hindsight-recall.js";
 import { PollRunFolder, type PollRunData } from "../src/poll-fold.js";
 import {
 	createShadowTool,
@@ -263,7 +264,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		"start-failed", "spawn-error", "parse-error", "write-failed",
 		"mode-apply-failed", "timeout", "stall", "auth-required",
 		"session-load-failed-creating-fresh", "connection-exited", "cancel-failed",
-		"unsupported-server-request",
+		"unsupported-server-request", "turn-recall-unavailable", "recall-oversize",
 	]);
 	const streamDriver = new StreamDriver();
 	// Mirror the stream driver's lifecycle ring into the daily file log
@@ -641,6 +642,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		onNativeBackground: (info) => armConversationWatcher(info.conversationId, info.turnStartMs),
 		roster,
 		bridgeCatalog: () => (mcpHandle && loadConfig().bridgeTools !== "none" ? listTools() : []),
+		projectHindsightRecall: engine === "acp" ? registerHindsightRecall(pi) : undefined,
 		engine,
 		log: fileLog.log.bind(fileLog),
 	});
@@ -1131,6 +1133,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			}
 			gateScriptPath = null;
 		}
+		await store.flush();
 	});
 }
 
@@ -1716,7 +1719,7 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 					ui?.notify(
 						next.digest
 							? "digest on. pi-side context (compaction summaries, other-provider turns) is injected into each agy prompt. Note: this defeats agy's prompt cache (~25-30k tokens re-billed per turn)."
-							: "digest off. agy prompts contain only your message; agy's prompt cache stays stable. Enable when mixing providers in one session and agy must see pi-side context.",
+							: "digest off. agy receives the latest user message. ACP can also receive automatic Hindsight recall independently of the digest. Enable digest for compaction summaries and other-provider turns.",
 						"info",
 					);
 				} else {
@@ -1856,7 +1859,7 @@ async function openAgyPicker(ui: ExtensionUIContext, ctx: AgyCommandCtx): Promis
 			id: "digest",
 			label: "Context digest",
 			description:
-				"Inject a delta of pi-side context into each agy prompt. Defeats agy's prompt cache (~25-30k tokens re-billed per turn).",
+				"Inject a delta of pi-side context into agy requests. ACP Hindsight recall is independent of this setting. Defeats agy's prompt cache (~25-30k tokens re-billed per turn).",
 			currentValue: config.digest ? "on" : "off",
 			values: ["on", "off"],
 		},

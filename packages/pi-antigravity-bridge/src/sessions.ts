@@ -178,6 +178,11 @@ export class SessionStore {
 			});
 	}
 
+	/** Wait for session binding writes already queued by this store. */
+	flush(): Promise<void> {
+		return this.writeChain;
+	}
+
 	/** Count persisted session bindings (for status display). */
 	get size(): number {
 		return Object.keys(this.cache).length;

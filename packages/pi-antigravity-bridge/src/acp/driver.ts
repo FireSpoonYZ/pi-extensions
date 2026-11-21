@@ -4,8 +4,8 @@
 //
 // Engine differences vs stream-json, all verified live (docs/ACP-PROTOCOL-REFERENCE.md):
 //   - no process recycle on model/mode/effort/cwd drift: one server process,
-//     sessions selected per turn via session/new / session/load; only a
-//     changed request.agent recycles the process (before creating the next turn)
+//     sessions selected per turn via session/new / session/load; a changed
+//     request.agent or a missing recall listener on a recall turn recycles it
 //   - model and thought_level are separate session/set_config_option calls
 //   - config does NOT persist across server restarts: re-applied every turn
 //   - session/load replays history as full-text notification pairs BEFORE its
@@ -21,6 +21,7 @@
 
 import { randomUUID } from "node:crypto";
 import type { UsageEstimate } from "../config.js";
+import { SYS_AGENT_PREFIX } from "../sysprompt-agent.js";
 import { AcpConnection, type AcpMcpServer, type AcpPermissionRequest } from "./connection.js";
 import type { AcpPermissionHandler } from "./connection.js";
 import { mapStopReason, mapUpdate, TextAccumulator, type AcpEditDiff } from "./events.js";
@@ -253,17 +254,19 @@ export class AcpDriver implements TurnDriver {
 		// /compact after a model switch failed with "ACP driver is shut down."
 		if (request.signal?.aborted) return Promise.reject(new Error("aborted before start"));
 
+		const agentChanged = this.#connAgent !== request.agent;
+		const retryRecall = request.turnRecall && this.#conn?.turnRecallUnavailable;
 		// Recycle BEFORE creating the new active turn and clear #conn first so
 		// the replaced connection's exit lands in #onConnectionExit as stale and
 		// never settles the replacement turn.
-		if (this.#conn && this.#connAgent !== request.agent) {
+		if (this.#conn && (agentChanged || retryRecall)) {
 			const prev = this.#conn;
 			const from = this.#connAgent ?? null;
 			this.#conn = undefined;
 			this.#connAgent = undefined;
 			this.#state = "dead";
-			this.#log("recycle-agent", { from, to: request.agent ?? null });
-			prev.abortAll("agent changed");
+			this.#log(agentChanged ? "recycle-agent" : "recycle-recall-listener", { from, to: request.agent ?? null });
+			prev.abortAll(agentChanged ? "agent changed" : "turn recall listener unavailable");
 			prev.kill();
 		}
 
@@ -303,6 +306,7 @@ export class AcpDriver implements TurnDriver {
 	async #executeTurn(turn: ActiveTurn): Promise<void> {
 		const request = turn.request;
 		const conn = await this.#ensureConnection(request);
+		if (turn.closed) return;
 
 		// Session: load (resume) or create. Load failures fall back to a fresh
 		// session — a missing conversation must not fail the turn (9.4).
@@ -377,7 +381,13 @@ export class AcpDriver implements TurnDriver {
 		try {
 			// Nothing to cancel before the prompt RPC exists; see promptStarted.
 			turn.promptStarted = true;
-			const result = await conn.prompt(turn.sessionId, request.prompt, request.images, request.contextBlock);
+			const result = await conn.prompt(
+				turn.sessionId,
+				request.prompt,
+				request.images,
+				request.contextBlock,
+				request.turnRecall,
+			);
 			if (turn.closed) return;
 			turn.sawResult = true;
 			// Exact PromptResponse.usage supersedes every partial estimate, but
@@ -572,6 +582,9 @@ export class AcpDriver implements TurnDriver {
 			isolateHome: this.#opts.isolateHome,
 			agent: request.agent,
 			includeDefaultCustomizations: restricted ? false : undefined,
+			// agy pins the hook list when the session is created. Prepare it
+			// even when this turn has no recall, so later turns can use it.
+			enableTurnRecall: request.agent?.startsWith(SYS_AGENT_PREFIX),
 			agentsRoot: this.#opts.agentsRoot,
 			extraEnv: this.#opts.extraEnv,
 			cwd: request.cwd,
@@ -596,6 +609,7 @@ export class AcpDriver implements TurnDriver {
 		return conn
 			.start()
 			.then(() => {
+				if (this.#conn !== conn) throw new Error("ACP connection closed during startup");
 				this.#serverVersion = conn.serverVersion();
 				const info = conn.agentInfo as { name?: unknown; title?: unknown } | undefined;
 				this.#agentInfo = {
@@ -608,9 +622,11 @@ export class AcpDriver implements TurnDriver {
 			.catch((err) => {
 				// A server that spawned but failed the handshake (init timeout,
 				// auth hang) must not leak: it is detached, so it outlives pi.
-				this.#state = "dead";
-				this.#conn = undefined;
-				this.#connAgent = undefined;
+				if (this.#conn === conn) {
+					this.#state = "dead";
+					this.#conn = undefined;
+					this.#connAgent = undefined;
+				}
 				conn.kill();
 				this.#log("start-failed", { message: describe(err) });
 				throw err;

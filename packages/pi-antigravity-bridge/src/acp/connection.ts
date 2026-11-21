@@ -19,7 +19,8 @@ import { frameCarriesUsage } from "./events.js";
 import type { AgyUsage } from "../driver-types.js";
 import { redactText } from "../redact.js";
 import { JsonRpcResponseError, JsonRpcSession } from "./jsonrpc.js";
-import { removeStagedAgyHome, stageAgyHome } from "./home.js";
+import { markStagedAgyHomeSessionCreated, removeStagedAgyHome, stageAgyHome } from "./home.js";
+import { ACP_RECALL_DISABLED_ENV, acpRecallHookCommand, createAcpRecallHook, type AcpRecallHook } from "./recall-hook.js";
 
 export interface AcpMcpServer {
 	name: string;
@@ -54,6 +55,8 @@ export interface AcpConnectionOptions {
 	agent?: string;
 	/** When false, passes `--include-default-customizations=false`. */
 	includeDefaultCustomizations?: boolean;
+	/** Enable the bridge-owned hook in the isolated provider carrier. */
+	enableTurnRecall?: boolean;
 	/** Explicit agent discovery root for isolated home staging (tests). */
 	agentsRoot?: string;
 	extraEnv?: Record<string, string>;
@@ -107,10 +110,13 @@ export type AcpPermissionHandler = (req: AcpPermissionRequest) => Promise<string
 
 export class AcpConnection {
 	#opts: AcpConnectionOptions;
+	#startPromise: Promise<void> | undefined;
 	#child: ChildProcess | undefined;
 	#rpc: JsonRpcSession | undefined;
 	#stderrTail = "";
 	#stagedHome: string | undefined;
+	#recallHook: AcpRecallHook | undefined;
+	#recallBinding: { sessionId: string; release: () => void } | undefined;
 	#usageSeen = false;
 	/** Set ONLY by a parsed PromptResponse.usage; this gates estimate
 	 *  suppression. #usageSeen stays diagnostic: any usage-shaped frame trips
@@ -136,6 +142,10 @@ export class AcpConnection {
 
 	get alive(): boolean {
 		return this.#child !== undefined && !this.#exited && !this.#killed;
+	}
+
+	get turnRecallUnavailable(): boolean {
+		return Boolean(this.#opts.enableTurnRecall && this.#opts.isolateHome && !this.#recallHook?.listening);
 	}
 
 	get pid(): number | undefined {
@@ -169,8 +179,13 @@ export class AcpConnection {
 
 	/** Spawn the server and perform the initialize handshake. Idempotent per
 	 *  instance: call once. */
-	async start(): Promise<void> {
-		if (this.#child) return;
+	start(): Promise<void> {
+		this.#startPromise ??= this.#start();
+		return this.#startPromise;
+	}
+
+	async #start(): Promise<void> {
+		if (this.#killed) throw new Error("ACP connection closed before startup");
 		const args = [...(this.#opts.binArgs ?? [])];
 		if (this.#opts.agent) {
 			args.push("--agent", this.#opts.agent);
@@ -178,36 +193,58 @@ export class AcpConnection {
 		if (this.#opts.includeDefaultCustomizations === false) {
 			args.push("--include-default-customizations=false");
 		}
-		if (this.#opts.isolateHome) {
-			const homeOpts = typeof this.#opts.isolateHome === "object" ? this.#opts.isolateHome : {};
-			const sessionMcp = this.#opts.mcpServers?.() ?? [];
-			const agentMcpServers =
-				this.#opts.agent && sessionMcp.length > 0
-					? sessionMcp.map((s) => ({
-							name: s.name,
-							serverUrl: s.url,
-							headers: Object.fromEntries(s.headers.map((h) => [h.name, h.value])),
-						}))
-					: undefined;
-			this.#stagedHome = stageAgyHome({
-				...homeOpts,
-				inheritGlobalMcp: false,
-				...(this.#opts.agent ? { agent: this.#opts.agent } : {}),
-				...(this.#opts.agentsRoot ? { agentsRoot: this.#opts.agentsRoot } : {}),
-				...(agentMcpServers ? { agentMcpServers } : {}),
-			});
-			args.push("--gemini-dir", this.#stagedHome);
-		}
 		let child: ChildProcess;
+		let recallEnv: Readonly<Record<string, string>> | undefined;
 		try {
+			if (this.#opts.isolateHome) {
+				let recallCommand: string | undefined;
+				if (this.#opts.enableTurnRecall && this.#opts.agent) {
+					try {
+						this.#recallHook = await createAcpRecallHook({
+							onOversize: (bytes, limitBytes) => this.#opts.log("recall-oversize", { bytes, limitBytes }),
+						});
+					} catch {
+						this.#opts.log("turn-recall-unavailable");
+					}
+					// A close while the listener was opening must not leave a
+					// newly detached agy process or a surviving recall listener.
+					if (this.#killed) throw new Error("ACP connection closed before startup");
+					// AGY pins the command to the session. Stage it even if the
+					// listener could not start, so reconnecting can recover.
+					recallCommand = this.#recallHook?.command ?? acpRecallHookCommand();
+					recallEnv = this.#recallHook?.env ?? ACP_RECALL_DISABLED_ENV;
+				}
+				const homeOpts = typeof this.#opts.isolateHome === "object" ? this.#opts.isolateHome : {};
+				const sessionMcp = this.#opts.mcpServers?.() ?? [];
+				const agentMcpServers =
+					this.#opts.agent && sessionMcp.length > 0
+						? sessionMcp.map((s) => ({
+								name: s.name,
+								serverUrl: s.url,
+								headers: Object.fromEntries(s.headers.map((h) => [h.name, h.value])),
+							}))
+						: undefined;
+				this.#stagedHome = stageAgyHome({
+					...homeOpts,
+					inheritGlobalMcp: false,
+					...(this.#opts.agent ? { agent: this.#opts.agent } : {}),
+					...(this.#opts.agentsRoot ? { agentsRoot: this.#opts.agentsRoot } : {}),
+					...(agentMcpServers ? { agentMcpServers } : {}),
+					agentRecallHookCommand: recallCommand,
+				});
+				args.push("--gemini-dir", this.#stagedHome);
+			}
 			child = spawn(this.#opts.bin, args, {
 				cwd: this.#opts.cwd,
 				stdio: ["pipe", "pipe", "pipe"],
 				detached: process.platform !== "win32",
 				windowsHide: true,
-				...(this.#opts.extraEnv ? { env: { ...process.env, ...this.#opts.extraEnv } } : {}),
+				...(this.#opts.extraEnv || recallEnv
+					? { env: { ...process.env, ...this.#opts.extraEnv, ...recallEnv } }
+					: {}),
 			});
 		} catch (err) {
+			this.#releaseRecallHook();
 			this.#releaseHome();
 			throw err;
 		}
@@ -296,6 +333,9 @@ export class AcpConnection {
 		if (typeof sessionId !== "string" || sessionId.length === 0) {
 			throw new Error("ACP session/new returned no sessionId");
 		}
+		if (this.#stagedHome && this.#opts.enableTurnRecall && this.#opts.agent) {
+			markStagedAgyHomeSessionCreated(this.#stagedHome, this.#opts.agent);
+		}
 		this.#updateSessionId = sessionId;
 		this.lastConfigOptions = result.configOptions;
 		return { sessionId };
@@ -334,7 +374,11 @@ export class AcpConnection {
 		text: string,
 		images: Array<{ data: string; mimeType: string }> = [],
 		contextBlock?: { uri: string; text: string },
+		turnRecall?: string,
 	): Promise<{ stopReason: string; usage?: AgyUsage }> {
+		if (turnRecall && !this.#recallHook?.listening) {
+			throw new Error("ACP turn recall is unavailable because the private hook listener is down");
+		}
 		// Block order: images, then the embedded-context resource (pi-side
 		// digest), then the text question last (it refers to everything before
 		// it). Shapes per the ACP v1 content-block schema; embeddedContext is
@@ -353,9 +397,14 @@ export class AcpConnection {
 			});
 		}
 		blocks.push({ type: "text", text });
+		const release = this.#recallHook?.bind(sessionId, turnRecall);
+		const binding = release ? { sessionId, release } : undefined;
+		if (binding) this.#recallBinding = binding;
 		const result = (await this.request("session/prompt", {
 			sessionId,
 			prompt: blocks,
+		}).finally(() => {
+			if (this.#recallBinding === binding) this.#clearTurnRecall();
 		})) as Record<string, unknown> | undefined;
 		const stopReason = result?.stopReason;
 		if (typeof stopReason !== "string") {
@@ -373,6 +422,7 @@ export class AcpConnection {
 
 	cancel(sessionId: string): void {
 		if (!this.#rpc || !this.alive) throw new Error("ACP connection is not running");
+		if (this.#recallBinding?.sessionId === sessionId) this.#clearTurnRecall();
 		this.#rpc.notify("session/cancel", { sessionId });
 		for (const cancel of [...this.#permissionPending]) cancel();
 	}
@@ -537,14 +587,20 @@ export class AcpConnection {
 	/** Gate D teardown: reject every pending request, then kill the process.
 	 *  Nothing is ever written to the dying transport; no promise survives. */
 	abortAll(reason: string): void {
+		this.#clearTurnRecall();
 		this.#rpc?.abortAll(reason);
 	}
 	kill(): void {
 		if (this.#killed) return;
 		this.#killed = true;
 		this.abortAll("connection killed");
+		this.#releaseRecallHook();
 		const child = this.#child;
-		if (!child || this.#exited) return;
+		if (!child) {
+			this.#finish("connection killed");
+			return;
+		}
+		if (this.#exited) return;
 		this.#opts.log("kill", { pid: child.pid ?? "?" });
 		try {
 			if (child.pid && process.platform !== "win32") {
@@ -573,6 +629,7 @@ export class AcpConnection {
 		this.#permissionPending.clear();
 		for (const deny of pendings) deny();
 		this.abortAll(`connection exited: ${reason || "process gone"}`);
+		this.#releaseRecallHook();
 		this.#releaseHome();
 		this.#opts.onExit({ code, signal, stderrTail: redactText(this.#stderrTail) });
 	}
@@ -580,6 +637,17 @@ export class AcpConnection {
 	#releaseHome(): void {
 		if (this.#stagedHome) removeStagedAgyHome(this.#stagedHome);
 		this.#stagedHome = undefined;
+	}
+
+	#clearTurnRecall(): void {
+		const binding = this.#recallBinding;
+		this.#recallBinding = undefined;
+		binding?.release();
+	}
+
+	#releaseRecallHook(): void {
+		this.#recallHook?.close();
+		this.#recallHook = undefined;
 	}
 }
 

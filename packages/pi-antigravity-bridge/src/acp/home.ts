@@ -1,9 +1,18 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isPidAlive } from "../mcp-server.js";
 import { bridgeServerEntry, bridgeServerName, readGlobalMcpConfig } from "../mcp-registration.js";
 import { isValidAgyAgentName } from "../agents.js";
+import { SYS_AGENT_PREFIX } from "../sysprompt-agent.js";
+import { ACP_RECALL_HOOK_NAME } from "./recall-hook.js";
+
+const HOOKS_FILE = "hooks.json";
+const CREATED_AGENT_MARKER = ".recall-agent";
+const RETIRED_AGENT_MARKER = ".recall-agent-retired";
+const MAX_AGENT_MARKER_BYTES = 256;
+const ACP_STAGED_HOME_NAME = /^acp-home-\d+-[a-zA-Z0-9]+$/;
 
 function record(value: unknown, label: string): Record<string, unknown> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must contain a JSON object`);
@@ -62,14 +71,61 @@ function formatAgentMcpYaml(servers: readonly AgentMcpServerSpec[]): string {
 	return lines.join("\n");
 }
 
-function injectAgentMcpServers(md: string, servers: readonly AgentMcpServerSpec[]): string {
-	if (servers.length === 0) return md;
+function recallManifestMatches(file: string, content: string): boolean {
+	try {
+		return fs.readFileSync(file, "utf8") === content;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+		return false;
+	}
+}
+
+/** AGY retains the resolved hook path with the conversation. Keep the static
+ *  handler definition outside the per-spawn home that holds MCP credentials. */
+function stageRecallManifest(parentDir: string, stagedHome: string, command: string): string {
+	const content = JSON.stringify({
+		[ACP_RECALL_HOOK_NAME]: {
+			PreInvocation: [{ type: "command", command, timeout: 3 }],
+		},
+	});
+	const hash = createHash("sha256").update(content).digest("hex");
+	const dir = path.join(parentDir, "recall-hooks", hash);
+	const file = path.join(dir, HOOKS_FILE);
+	if (recallManifestMatches(file, content)) return file;
+
+	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+	// The per-spawn home provides a unique temporary file on the same volume.
+	const pending = path.join(stagedHome, "recall-hooks.json.tmp");
+	fs.writeFileSync(pending, content, { mode: 0o600 });
+	try {
+		fs.renameSync(pending, file);
+	} catch (err) {
+		// A concurrent process may have installed and opened the same manifest.
+		if (!recallManifestMatches(file, content)) throw err;
+		fs.rmSync(pending, { force: true });
+	}
+	return file;
+}
+
+function configurePrivateAgent(
+	md: string,
+	servers: readonly AgentMcpServerSpec[],
+	recallHookPath?: string,
+): string {
+	if (servers.length === 0 && !recallHookPath) return md;
 	const match = /^---\r?\n([\s\S]*?)\r?\n---(\r?\n|$)/.exec(md);
 	if (!match) throw new Error("ACP carrier agent.md is missing YAML frontmatter");
-	const frontmatter = match[1];
+	let frontmatter = match[1];
+	if (recallHookPath) {
+		const emptyHooks = /^hooks: \[\]\r?$/m;
+		if (!emptyHooks.test(frontmatter)) throw new Error("ACP carrier agent.md must declare an empty hooks list");
+		// Explicit Markdown hook entries resolve relative to the agent.
+		frontmatter = frontmatter.replace(emptyHooks, `hooks:\n  - ${JSON.stringify(recallHookPath)}`);
+	}
+	if (servers.length > 0) frontmatter += `\n${formatAgentMcpYaml(servers)}`;
 	const suffix = match[2];
 	const rest = md.slice(match[0].length);
-	return `---\n${frontmatter}\n${formatAgentMcpYaml(servers)}\n---${suffix}${rest}`;
+	return `---\n${frontmatter}\n---${suffix}${rest}`;
 }
 
 export interface StageAgyHomeOptions {
@@ -101,6 +157,8 @@ export interface StageAgyHomeOptions {
 	 *  custom Agent definition at creation time without writing secrets to the
 	 *  global agent file. */
 	agentMcpServers?: AgentMcpServerSpec[];
+	/** Bridge-owned PreInvocation handler for the private carrier. */
+	agentRecallHookCommand?: string;
 }
 
 /** Isolate a spawned agy from per-pid bridge entries in the global MCP
@@ -151,6 +209,11 @@ export function stageAgyHome(opts: StageAgyHomeOptions = {}): string {
 		fs.writeFileSync(path.join(staged, "config", "mcp_config.json"), JSON.stringify({ ...config, mcpServers: filtered }), { mode: 0o600 });
 
 		const appData = path.join(geminiHome, "antigravity-cli");
+		if (opts.agent) {
+			// On a fresh install, create the durable target before agy sees
+			// the staged home so its first conversation survives a recycle.
+			fs.mkdirSync(appData, { recursive: true, mode: 0o700 });
+		}
 		if (fs.existsSync(appData)) linkDirectory(appData, path.join(staged, "antigravity-cli"));
 		const instructions = path.join(geminiHome, "GEMINI.md");
 		if (inheritGlobalMcp && fs.existsSync(instructions)) fs.copyFileSync(instructions, path.join(staged, "GEMINI.md"));
@@ -159,6 +222,7 @@ export function stageAgyHome(opts: StageAgyHomeOptions = {}): string {
 			for (const entry of fs.readdirSync(globalConfigDir, { withFileTypes: true })) {
 				if (entry.name === "mcp_config.json") continue;
 				if (skipAgentsJunction && entry.name === "agents") continue;
+				if (opts.agentRecallHookCommand && entry.name === HOOKS_FILE) continue;
 				const source = path.join(globalConfigDir, entry.name);
 				const target = path.join(staged, "config", entry.name);
 				let stat: fs.Stats | fs.Dirent = entry;
@@ -178,9 +242,17 @@ export function stageAgyHome(opts: StageAgyHomeOptions = {}): string {
 			const targetDir = path.join(staged, "config", "agents", opts.agent);
 			fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
 			const rawAgentMd = fs.readFileSync(carrierMd, "utf8");
-			const privateAgentMd = opts.agentMcpServers?.length
-				? injectAgentMcpServers(rawAgentMd, opts.agentMcpServers)
-				: rawAgentMd;
+			const recallManifest = opts.agentRecallHookCommand
+				? stageRecallManifest(parentDir, staged, opts.agentRecallHookCommand)
+				: undefined;
+			const recallHookPath = recallManifest
+				? path.relative(targetDir, recallManifest).split(path.sep).join("/")
+				: undefined;
+			const privateAgentMd = configurePrivateAgent(
+				rawAgentMd,
+				opts.agentMcpServers ?? [],
+				recallHookPath,
+			);
 			fs.writeFileSync(path.join(targetDir, "agent.md"), privateAgentMd, { mode: 0o600 });
 		}
 		return staged;
@@ -226,11 +298,93 @@ export function writeOwnBridgeEntry(staged: string, entry: { pid: number; port: 
 	fs.renameSync(tmp, cfgPath);
 }
 
+function isRealDirectory(dir: string): boolean {
+	const stat = fs.lstatSync(dir, { throwIfNoEntry: false });
+	return stat?.isDirectory() === true && !stat.isSymbolicLink();
+}
+
+function isRecallCarrierName(agent: string): boolean {
+	return agent.length < MAX_AGENT_MARKER_BYTES && agent.startsWith(SYS_AGENT_PREFIX) && isValidAgyAgentName(agent);
+}
+
+function readRecallAgentMarker(staged: string, marker: string): string | undefined {
+	const file = path.join(staged, marker);
+	try {
+		const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+		if (!stat?.isFile() || stat.isSymbolicLink() || stat.size > MAX_AGENT_MARKER_BYTES) return;
+		const content = fs.readFileSync(file, "utf8");
+		if (!content.endsWith("\n")) return;
+		const agent = content.slice(0, -1);
+		return isRecallCarrierName(agent) ? agent : undefined;
+	} catch (err) {
+		// Another sweep may have renamed the marker between lstat and read.
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+	}
+}
+
+/** A newly created AGY conversation keeps its original carrier directory as
+ *  a hook path anchor. Record only the generated basename, after session/new. */
+export function markStagedAgyHomeSessionCreated(staged: string, agent: string): void {
+	if (!ACP_STAGED_HOME_NAME.test(path.basename(staged)) || !isRecallCarrierName(agent)) {
+		throw new Error("Cannot retain an invalid ACP carrier directory");
+	}
+	const config = path.join(staged, "config");
+	const agents = path.join(config, "agents");
+	if (!isRealDirectory(staged) || !isRealDirectory(config) || !isRealDirectory(agents) ||
+		!isRealDirectory(path.join(agents, agent))) {
+		throw new Error("Cannot retain a missing or linked ACP carrier directory");
+	}
+	const recorded = readRecallAgentMarker(staged, CREATED_AGENT_MARKER);
+	if (recorded === agent) return;
+	if (recorded !== undefined) throw new Error("ACP staged home already has a different carrier");
+	const marker = path.join(staged, CREATED_AGENT_MARKER);
+	const pending = `${marker}.tmp`;
+	try {
+		fs.writeFileSync(pending, `${agent}\n`, { mode: 0o600, flag: "wx" });
+		fs.renameSync(pending, marker);
+	} finally {
+		fs.rmSync(pending, { force: true });
+	}
+}
+
+function clearDirectoryExcept(dir: string, keep: readonly string[]): void {
+	if (!isRealDirectory(dir)) {
+		// rm unlinks a junction. Check each retained parent before reading
+		// its children, so no cleanup traverses a link to shared state.
+		fs.rmSync(dir, { recursive: true, force: true });
+		fs.mkdirSync(dir, { mode: 0o700 });
+		return;
+	}
+	for (const name of fs.readdirSync(dir)) {
+		if (!keep.includes(name)) fs.rmSync(path.join(dir, name), { recursive: true, force: true });
+	}
+}
+
+function retireRecallCarrier(staged: string, agent: string): void {
+	const config = path.join(staged, "config");
+	const agents = path.join(config, "agents");
+	clearDirectoryExcept(staged, ["config", CREATED_AGENT_MARKER, RETIRED_AGENT_MARKER]);
+	clearDirectoryExcept(config, ["agents"]);
+	clearDirectoryExcept(agents, [agent]);
+	clearDirectoryExcept(path.join(agents, agent), []);
+	fs.renameSync(path.join(staged, CREATED_AGENT_MARKER), path.join(staged, RETIRED_AGENT_MARKER));
+}
+
 export function removeStagedAgyHome(staged: string): void {
 	const base = path.basename(staged);
 	if (!base.startsWith("acp-home-") && !base.startsWith("agy-home-")) return;
 	try {
-		if (!fs.lstatSync(staged).isDirectory()) return;
+		if (!isRealDirectory(staged)) return;
+		if (ACP_STAGED_HOME_NAME.test(base)) {
+			const agent = readRecallAgentMarker(staged, CREATED_AGENT_MARKER);
+			if (agent) {
+				retireRecallCarrier(staged, agent);
+				return;
+			}
+			// Read the creation marker first: a concurrent sweep may have
+			// retired it, but never leaves a gap between the two markers.
+			if (readRecallAgentMarker(staged, RETIRED_AGENT_MARKER)) return;
+		}
 		fs.rmSync(staged, { recursive: true, force: true });
 	} catch {
 		// Connection teardown is best-effort; startup sweeps crash leftovers.

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "vitest";
-import { agyHomeStagingDir, removeStagedAgyHome, stageAgyHome, sweepStagedAgyHomes, writeOwnBridgeEntry } from "../src/acp/home.js";
+import { agyHomeStagingDir, markStagedAgyHomeSessionCreated, removeStagedAgyHome, stageAgyHome, sweepStagedAgyHomes, writeOwnBridgeEntry } from "../src/acp/home.js";
 import { sweepStaleBridgeDirs } from "../src/mcp-server.js";
 
 const fixtureRoots: string[] = [];
@@ -223,4 +223,53 @@ test("writeOwnBridgeEntry adds the own entry to an already-staged bridgeless hom
 	} finally {
 		fs.rmSync(home, { recursive: true, force: true });
 	}
+});
+
+test("a fresh carrier persists the native conversation and only its empty hook directory on retirement", () => {
+	const { root, parentDir } = fixture();
+	const geminiHome = path.join(root, "fresh-gemini");
+	const agent = "pi-bridge-sys-test";
+	const carrier = path.join(geminiHome, "config", "agents", agent);
+	fs.mkdirSync(carrier, { recursive: true });
+	const original = "---\nname: " + agent + "\ninheritCustomizations: false\nhooks: []\n---\nAgent body\n";
+	fs.writeFileSync(path.join(carrier, "agent.md"), original);
+	const opts = { geminiHome, parentDir, agent, inheritGlobalMcp: false };
+	const ordinary = stageAgyHome(opts);
+	const privateCarrier = path.join("config", "agents", agent);
+	assert.equal(fs.existsSync(path.join(ordinary, privateCarrier, "hooks.json")), false);
+	fs.writeFileSync(path.join(ordinary, "antigravity-cli", "conversation"), "first turn");
+	removeStagedAgyHome(ordinary);
+
+	const enabledOpts = { ...opts, agentRecallHookCommand: "bridge-owned-command",
+		agentMcpServers: [{ name: "pi-bridge", serverUrl: "http://127.0.0.1:1", headers: { "x-bridge-token": "private-test" } }],
+	};
+	const enabled = stageAgyHome(enabledOpts);
+	assert.equal(fs.readFileSync(path.join(enabled, "antigravity-cli", "conversation"), "utf8"), "first turn");
+	const staged = path.join(enabled, privateCarrier);
+	const stagedMd = fs.readFileSync(path.join(staged, "agent.md"), "utf8");
+	const entry = /hooks:\s+- ("[^"\n]+")/.exec(stagedMd);
+	assert.ok(entry);
+	const hookFile = path.resolve(staged, JSON.parse(entry[1]));
+	assert.equal(path.basename(hookFile), "hooks.json");
+	const hooks = JSON.parse(fs.readFileSync(hookFile, "utf8"));
+	assert.deepEqual(Object.keys(hooks), ["pi-bridge-turn-recall"]);
+	assert.equal(hooks["pi-bridge-turn-recall"].PreInvocation[0].command, "bridge-owned-command");
+	assert.ok(stagedMd.includes("private-test"));
+	markStagedAgyHomeSessionCreated(enabled, agent);
+	removeStagedAgyHome(enabled);
+	assert.ok(fs.existsSync(hookFile));
+	assert.deepEqual(fs.readdirSync(staged), []);
+	assert.deepEqual(fs.readdirSync(path.join(enabled, "config")), ["agents"]);
+	assert.equal(fs.existsSync(path.join(enabled, "antigravity-cli")), false);
+
+	const live = stageAgyHome(enabledOpts);
+	markStagedAgyHomeSessionCreated(live, agent);
+	const crashed = path.join(parentDir, "acp-home-4194303-crashed");
+	fs.renameSync(live, crashed);
+	sweepStagedAgyHomes(parentDir, () => false);
+	assert.deepEqual(fs.readdirSync(path.join(crashed, privateCarrier)), []);
+	assert.deepEqual(fs.readdirSync(path.join(crashed, "config")), ["agents"]);
+	assert.equal(fs.readFileSync(path.join(geminiHome, "antigravity-cli", "conversation"), "utf8"), "first turn");
+	assert.equal(fs.readFileSync(path.join(carrier, "agent.md"), "utf8"), original);
+	assert.equal(fs.existsSync(path.join(carrier, "hooks.json")), false);
 });
