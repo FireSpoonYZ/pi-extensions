@@ -27,6 +27,7 @@ import {
 	createEditToolDefinition,
 	createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { getCurrentTools } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { DIALOG_OPTIONS, DialogMenu, dialogBlocked, type DialogRow } from "@estebanforge/pi-tui-dialogs";
 import {
@@ -100,7 +101,7 @@ import {
 	type SkillLite,
 } from "../src/skills.js";
 import { mapAgyToolToNative } from "../src/native-tools.js";
-import { bridgedPiTools } from "../src/bridge-catalog.js";
+import { BRIDGE_POLL_TOOL, bridgedPiTools, projectCodeModeOnlyTools, toBridgeCatalog } from "../src/bridge-catalog.js";
 import { Type } from "typebox";
 import { patchStatus, restorePatch } from "../src/patch-cleanup.js";
 import { withDialogLock } from "../src/dialog-lock.js";
@@ -204,6 +205,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// Session-only visibility overrides; never change either application's MCP config.
 	const hiddenBridgeTools = new Set<string>();
 	const getBridgeTools = () => bridgedPiTools(pi.getAllTools(), pi.getActiveTools(), loadConfig().bridgeTools, hiddenBridgeTools);
+	const codeModeOnly = () => pi.getSettings().codemode?.mode === "only" && pi.getActiveTools().includes("codemode");
+	const allowedAcpNames = () => new Set((mcpHandle ? getBridgeTools() : []).map(({ name }) => name));
+	pi.on("context_with_system", (event, ctx) => {
+		if (!codeModeOnly()) return;
+		const modelOnlyNames = new Set(pi.getAllTools().filter((tool) => tool.exposure === "model-only").map(({ name }) => name));
+		const acp = engine === "acp" && ctx.model?.provider === "antigravity";
+		const messages = projectCodeModeOnlyTools(event.messages, modelOnlyNames, acp ? allowedAcpNames() : undefined);
+		return messages ? { messages } : undefined;
+	});
 	// Populated on session_start once ctx.isProjectTrusted() is known; empty before start.
 	let bridgeSkills: SkillLite[] = [];
 	const listTools = () => {
@@ -229,16 +239,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		// Bridge-local, like activate_skill: answered from the escalation
 		// registry without a pi round-trip. Pairs with the STILL RUNNING
 		// early-ack that keeps slow calls under agy's ~180s request deadline.
-		tools.push({
-			name: POLL_TOOL_NAME,
-			description:
-				"Fetch the result of a long-running bridge tool call that answered STILL RUNNING with a callId. Poll again if it still reports running; the result or an error arrives here.",
-			inputSchema: {
-				type: "object",
-				properties: { callId: { type: "string", description: "callId from the STILL RUNNING answer" } },
-				required: ["callId"],
-			},
-		});
+		tools.push(...toBridgeCatalog([BRIDGE_POLL_TOOL]));
 		return tools;
 	};
 	// Approval-gate hook script (per-pid, token embedded). Written at session
@@ -642,6 +643,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		onNativeBackground: (info) => armConversationWatcher(info.conversationId, info.turnStartMs),
 		roster,
 		bridgeCatalog: () => (mcpHandle && loadConfig().bridgeTools !== "none" ? listTools() : []),
+		acpToolCatalog: (context) => {
+			if (!codeModeOnly()) return undefined;
+			const allowed = allowedAcpNames();
+			const tools = getCurrentTools(context.messages).filter(({ name }) =>
+				allowed.has(name) || (name === POLL_TOOL_NAME && allowed.size > 0));
+			return toBridgeCatalog(tools);
+		},
 		projectHindsightRecall: engine === "acp" ? registerHindsightRecall(pi) : undefined,
 		engine,
 		log: fileLog.log.bind(fileLog),
@@ -908,6 +916,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			args: Record<string, unknown>,
 			signal: AbortSignal,
 		) => {
+			const catalog = engine === "acp" ? acpDriver.toolCatalog : undefined;
+			if (catalog && !catalog.some((tool) => tool.name === name)) {
+				return Promise.resolve({ content: [{ type: "text", text: `Pi tool ${name} was not declared for this ACP prompt` }], isError: true });
+			}
 			// Bridge-local, like activate_skill: answered from the escalation
 			// registry, never parked into pi.
 			if (name === POLL_TOOL_NAME) {
@@ -952,7 +964,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		};
 		const r = await startMcpServer(
 			{
-				listTools,
+				listTools: () => {
+					const catalog = engine === "acp" ? acpDriver.toolCatalog : undefined;
+					return loadConfig().bridgeTools === "none" ? [] : (catalog ? [...catalog] : listTools());
+				},
 				onToolCall: bridgeOnToolCall,
 				onApproval: (ticket, payload) => roundTrips.onApproval(ticket, payload),
 			},

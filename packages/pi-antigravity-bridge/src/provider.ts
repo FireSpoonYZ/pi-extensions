@@ -34,6 +34,7 @@ import {
 import fs from "node:fs";
 import type { Api } from "@earendil-works/pi-ai";
 import type { DriverActivity, TurnDriver, TurnHandle } from "./driver-types.js";
+import { POLL_TOOL_NAME, type BridgeCatalogEntry } from "./bridge-catalog.js";
 import { looksBackgroundNativeCall } from "./background-watch.js";
 import { SubagentRoster } from "./subagent-roster.js";
 import { toPiUsage } from "./stream-events.js";
@@ -49,6 +50,8 @@ import { stageSyspromptAgent } from "./sysprompt-agent.js";
 import { buildImageNote, stagePromptImages } from "./prompt-images.js";
 import type { ProjectHindsightRecall } from "./hindsight-recall.js";
 import { MAX_FRAME_BYTES } from "./frame-guard.js";
+
+export { POLL_TOOL_NAME, type BridgeCatalogEntry } from "./bridge-catalog.js";
 
 const DEFAULT_TIMEOUT_MIN = 10;
 
@@ -199,11 +202,6 @@ function adaptPiSystemPrompt(systemPrompt: string): string {
 export const TOOL_PRIORITY_NOTE =
 	"[Tool priority: this conversation runs inside pi, not as a standalone agy session; the user only sees what surfaces in pi. Native interactive tools, for example ask_question, never reach the user. When a Pi Bridge tool covers the same purpose, always use the Pi Bridge tool; for user questions use ask_user_question. Your native file tools such as view_file only read brain artifacts and reject real filesystem paths; for any path on the user's machine use the Pi Bridge tools (read, ls, grep, find, edit, execute). Image files are visible to you: the Pi Bridge read tool returns image files as visible images (png, jpg, webp, gif, bmp), so never claim you cannot view images. When a bridge call answers STILL RUNNING, poll bridge_poll_result before doing other work: until you poll, the result (including any image) stays undelivered to you. Delegate subagent work the same way: when pi's tool list includes a delegation tool (for example subagent, Agent, agent_spawn, agent_wait, or subagent_run), always delegate through it and never through the native invoke_subagent, run_subagent, or manage_subagents; use native ones only if no pi delegation tool is listed, because native subagents run inside agy and are invisible to pi and anything watching it. Long-running bridge calls do not fail: after ~20 seconds the bridge answers STILL RUNNING with a callId; fetch the result with bridge_poll_result and poll until it lands. For work you already know is long, prefer exec_command's session-output pattern or background agents so you keep working while it runs.]";
 
-export interface BridgeCatalogEntry {
-	name: string;
-	description: string;
-	inputSchema: object;
-}
 
 /** Short bridge protocol note for the ACP restricted carrier agent.
  *  ACP runs with tools: [] and no default components, so native-tool priority
@@ -219,12 +217,16 @@ export const ACP_BRIDGE_NOTE =
 export function buildAcpAgentBody(
 	systemPrompt: string | undefined,
 	catalog: readonly BridgeCatalogEntry[] | undefined,
+	codeModeOnly = false,
 ): string {
 	const parts: string[] = [];
 	if (systemPrompt) {
 		parts.push(SYSTEM_PROMPT_PREAMBLE, systemPrompt, SYSTEM_PROMPT_END);
 	}
 	parts.push(ACP_BRIDGE_NOTE);
+	if (codeModeOnly && catalog?.some(({ name }) => name === "codemode")) {
+		parts.push("In Code Mode only, use codemode with searchTools(), describeTool(), and tools.* to discover and execute tools not declared below. Do not look for a separate tool_search.");
+	}
 	if (catalog !== undefined) {
 		if (catalog.length > 0) {
 			const entries = catalog.map((tool) => {
@@ -493,6 +495,8 @@ export interface StreamSimpleDeps {
 	/** Live Pi bridge tool catalog (incl. activate_skill and bridge_poll_result)
 	 *  wired from the extension's listTools closure for ACP agent prompts. */
 	bridgeCatalog?: () => BridgeCatalogEntry[];
+	/** Explicit catalog from the final Pi request when using ACP Code Mode only. */
+	acpToolCatalog?: (context: TranscriptContext) => readonly BridgeCatalogEntry[] | undefined;
 	/** Request-local Hindsight recall handoff from Pi's context hooks. */
 	projectHindsightRecall?: ProjectHindsightRecall;
 	/** Daily file log sink (src/daily-log.ts). Records pre-dispatch turn
@@ -542,7 +546,6 @@ export interface BridgeEscalation {
 	name: string;
 }
 
-export const POLL_TOOL_NAME = "bridge_poll_result";
 
 /** Default quiet period before a park escalates to a poll handle. Well under
  *  agy's ~180s request deadline; fast tools never see it. */
@@ -1197,6 +1200,7 @@ export interface DriverDeps {
 	roster?: SubagentRoster;
 	/** Live Pi bridge tool catalog forwarded from StreamSimpleDeps for ACP. */
 	bridgeCatalog?: () => BridgeCatalogEntry[];
+	toolCatalog?: readonly BridgeCatalogEntry[];
 	/** Recall attributed to this Pi request after removing its projected message. */
 	turnRecall?: string;
 	/** Use ACP bindings for conversations created with the recall hook. */
@@ -1551,7 +1555,7 @@ async function runTurnDriver(
 		const acpSysPrompt = config.systemPrompt
 			? adaptPiSystemPrompt(getCurrentSystemPrompt(context.messages)) || undefined
 			: undefined;
-		const body = buildAcpAgentBody(acpSysPrompt, deps.bridgeCatalog?.());
+		const body = buildAcpAgentBody(acpSysPrompt, deps.toolCatalog ?? deps.bridgeCatalog?.(), deps.toolCatalog !== undefined);
 		return stageSyspromptAgent(body, { acp: true });
 	};
 	const active = isContinuation ? deps.driver.reentry() : null;
@@ -1734,6 +1738,7 @@ async function runTurnDriver(
 				timeoutMin: config.turnTimeoutMin,
 				inactivityMin: config.inactivityTimeoutMin,
 				conversationId: redeliveryConversation ?? existing?.conversationId ?? null,
+				toolCatalog: deps.toolCatalog,
 				prompt: fullPrompt,
 				images: runImages.length > 0 ? runImages : undefined,
 				...(turnRecall === undefined || key !== preferredKey || redirectedRecovery ? {} : { turnRecall }),
@@ -1887,6 +1892,7 @@ async function runTurnDriver(
 					timeoutMin: config.turnTimeoutMin,
 					inactivityMin: config.inactivityTimeoutMin,
 					conversationId: conv,
+					toolCatalog: deps.toolCatalog,
 					prompt: buildLateResultPrompt(more) + stageImageNote(moreImages),
 					images: moreImages.length > 0 ? moreImages : undefined,
 					agent: lateAgent,
@@ -2032,7 +2038,8 @@ export function createStreamSimple(
 		if (selected && roundTrips) {
 			const useAcp = selected === deps.acpDriver;
 			const recall = useAcp ? deps.projectHindsightRecall?.(context, options) : undefined;
-			void runTurnDriver(stream, model, recall?.context ?? context, options, entries, store, {
+			const finalContext = recall?.context ?? context;
+			void runTurnDriver(stream, model, finalContext, options, entries, store, {
 				driver: selected,
 				roundTrips,
 				replay: deps.replay,
@@ -2041,6 +2048,7 @@ export function createStreamSimple(
 				onNativeBackground: deps.onNativeBackground,
 				roster: deps.roster,
 				bridgeCatalog: deps.bridgeCatalog,
+				toolCatalog: useAcp ? deps.acpToolCatalog?.(finalContext) : undefined,
 				turnRecall: recall?.turnRecall,
 				recallSessions: useAcp && deps.projectHindsightRecall !== undefined,
 				// Record the engine of the driver that will ACTUALLY run: if the

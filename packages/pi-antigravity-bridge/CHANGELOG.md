@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- ACP Code Mode only uses Pi's final tool declarations for the MCP catalog and dispatch. Discover tools inside `codemode` without growing the top-level tool list through `tool_search`. Preserve bridge polling and live permissions.
+
 ## [1.10.12] - 2026-11-22
 
 ### Fixed

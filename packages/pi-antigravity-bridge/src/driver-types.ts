@@ -13,6 +13,8 @@
 // teardown fallback, and `session/load` resume. See docs/ACP-ADOPTION-PLAN.md
 // section 9.
 
+import type { BridgeCatalogEntry } from "./bridge-catalog.js";
+
 export type DriverState = "idle" | "starting" | "ready" | "running" | "dead";
 
 export interface DriverProfile {
@@ -33,6 +35,8 @@ export interface DriverTurnRequest extends DriverProfile {
 	 *  `--conversation`. ACP: sessionId via `session/load` (falls back to
 	 *  `session/new` when the server no longer knows it). */
 	conversationId?: string | null;
+	/** Explicit ACP model catalog for this prompt, including any bridge-local tools. */
+	toolCatalog?: readonly BridgeCatalogEntry[];
 	prompt: string;
 	/** Image blocks riding with the prompt. ACP forwards them as typed
 	 *  content blocks (probe 2026-09-03: 64x64 two-tone PNG answered

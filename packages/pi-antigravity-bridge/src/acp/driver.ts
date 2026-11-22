@@ -141,6 +141,7 @@ export class AcpDriver implements TurnDriver {
 	#connAgent: string | undefined;
 	#generation = 0;
 	#active: ActiveTurn | undefined;
+	#toolCatalog: DriverTurnRequest["toolCatalog"];
 	#queueTail: Promise<void> = Promise.resolve();
 	#lifecycle: string[] = [];
 	#onTurnEnd: ((outcome: TurnOutcome) => void) | undefined;
@@ -162,6 +163,10 @@ export class AcpDriver implements TurnDriver {
 
 	get state(): DriverState {
 		return this.#state;
+	}
+
+	get toolCatalog(): DriverTurnRequest["toolCatalog"] {
+		return this.#toolCatalog;
 	}
 
 	get activeHandle(): TurnHandle | null {
@@ -271,6 +276,7 @@ export class AcpDriver implements TurnDriver {
 		}
 
 		const turn = this.#createTurn(request);
+		this.#toolCatalog = request.toolCatalog;
 		this.#active = turn;
 		this.#state = "running";
 		this.#stats.turns += 1;
