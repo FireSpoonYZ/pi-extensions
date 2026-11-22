@@ -12,18 +12,18 @@ const all = [
 ];
 
 describe("live Pi bridge catalog", () => {
-	it("uses the active set, not the registered set", () => {
-		expect(bridgedPiTools(all, ["read", "web_search"], "all", new Set()).map((t) => t.name)).toEqual(["web_search"]);
+	it("includes active builtins and extensions in all mode", () => {
+		expect(bridgedPiTools(all, ["read", "web_search"], "all", new Set()).map((t) => t.name)).toEqual(["web_search", "read"]);
 		expect(bridgedPiTools(all, ["mcp:files"], "all", new Set()).map((t) => t.name)).toEqual(["mcp:files"]);
 	});
 	it("supports session-only hide, MCP-only mode, and bridge-off", () => {
 		const active = all.map((tool) => tool.name);
-		expect(bridgedPiTools(all, active, "all", new Set(["web_search"])).map((t) => t.name)).toEqual(["mcp:files"]);
+		expect(bridgedPiTools(all, active, "all", new Set(["web_search"])).map((t) => t.name)).toEqual(["mcp:files", "read"]);
 		expect(bridgedPiTools(all, active, "mcp", new Set()).map((t) => t.name)).toEqual(["mcp:files"]);
 		expect(bridgedPiTools(all, active, "none", new Set()).map((t) => t.name)).toEqual([]);
 	});
 	it("never exposes the bridge's own tools, including the web wrappers", () => {
 		const active = all.map((tool) => tool.name);
-		expect(bridgedPiTools(all, active, "all", new Set()).map((t) => t.name)).toEqual(["web_search", "mcp:files"]);
+		expect(bridgedPiTools(all, active, "all", new Set()).map((t) => t.name)).toEqual(["web_search", "mcp:files", "read"]);
 	});
 });
