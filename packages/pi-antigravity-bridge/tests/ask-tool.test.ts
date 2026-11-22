@@ -14,7 +14,7 @@ import * as path from "node:path";
 import { test, vi } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { buildFinalPrompt, resolveAgyModel } from "@estebanforge/pi-ask-shared";
-import { reviewerAgentMd, stageReviewerAgent, toolModelsFromRaw } from "../src/ask-tool.js";
+import { resolveToolModel, reviewerAgentMd, stageReviewerAgent, toolModelsFromRaw } from "../src/ask-tool.js";
 import { parseAgentFrontmatter } from "./helpers/frontmatter.js";
 import { toAgyEffort } from "../src/models.js";
 
@@ -173,6 +173,25 @@ test("toAgyEffort: full pi thinking-level vocabulary clamps to agy tiers", () =>
 	assert.equal(toAgyEffort("xhigh", all), "high");
 	assert.equal(toAgyEffort("max", all), "high");
 	assert.equal(toAgyEffort(undefined, all), "low");
+	assert.equal(toAgyEffort("xhigh", [...all, "xhigh"]), "xhigh");
+	assert.equal(toAgyEffort("high", [...all, "xhigh"]), "high");
+});
+
+test("AskAntigravity resolves xhigh to an exact variant when agy lists one", () => {
+	const catalog = toolModelsFromRaw([RAW, "gemini-4-neon-low", "gemini-4-neon-high", "gemini-4-neon-xhigh"].join("\n"));
+	assert.deepEqual(resolveToolModel("gemini-4-neon", catalog, DEFAULT_THINKING, "xhigh"), {
+		model: "gemini-4-neon-xhigh",
+		thinking: "xhigh",
+	});
+	assert.deepEqual(resolveToolModel("gemini-4-neon-xhigh", catalog, DEFAULT_THINKING), {
+		model: "gemini-4-neon-xhigh",
+		thinking: "xhigh",
+	});
+	assert.deepEqual(resolveToolModel("flash", catalog, DEFAULT_THINKING, "xhigh"), {
+		model: "gemini-3.8-flash",
+		effort: "high",
+		thinking: "high",
+	});
 });
 
 test("resolveModel: short aliases still resolve when agy omits them (static overlay)", () => {

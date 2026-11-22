@@ -249,6 +249,23 @@ test("entriesFromRaw: two-column output drops banner tokens lacking a hyphen", (
 
 // --- toPiModel: toggle + level restriction follow the base's tiers -----------
 
+test("Gemini 4 models that list xhigh expose it as a thinking level and retain the qualified id", () => {
+	const catalog = entriesFromRaw([
+		"gemini-4-neon-high\tGemini 4 Neon (High)",
+		"gemini-4-neon-xhigh\tGemini 4 Neon (XHigh)",
+		"gemini-4-neon-medium\tGemini 4 Neon (Medium)",
+		"gemini-4-neon-low\tGemini 4 Neon (Low)",
+		"gemini-4-argon-high\tGemini 4 Argon (High)",
+		"gemini-4-argon-low\tGemini 4 Argon (Low)",
+	].join("\n"));
+	const [neon, qualified, argon] = catalog;
+	assert.deepEqual(neon, { full: "gemini-4-neon", id: "gemini-4-neon", efforts: ["low", "medium", "high", "xhigh"] });
+	assert.deepEqual(qualified, { full: "gemini-4-neon-xhigh", id: "gemini-4-neon-xhigh" });
+	assert.equal(toPiModel(neon).thinkingLevelMap?.xhigh, "xhigh");
+	assert.equal(toPiModel(neon).thinkingLevelMap?.max, undefined);
+	assert.equal(toPiModel(argon).thinkingLevelMap?.xhigh, undefined);
+});
+
 test("toPiModel: effort-driven base shows toggle restricted to its tiers", () => {
 	const flash = toPiModel({
 		full: "gemini-3.6-flash",

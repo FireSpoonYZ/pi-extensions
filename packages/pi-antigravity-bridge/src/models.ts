@@ -35,13 +35,10 @@ const DISCOVERY_TIMEOUT_MS = 8_000;
 export const MODELS_OUTPUT_CAP_BYTES = 1024 * 1024;
 
 /** Reasoning-effort tiers agy accepts via --effort. */
-export type AgyEffort = "low" | "medium" | "high";
-
-/** low < medium < high, for sorting/clamping. */
-const EFFORT_RANK: Record<AgyEffort, number> = { low: 0, medium: 1, high: 2 };
+export type AgyEffort = "low" | "medium" | "high" | "xhigh";
 
 /** pi thinking-effort order mirrors agy's, for clamping. */
-export const AGY_EFFORT_ORDER: readonly AgyEffort[] = ["low", "medium", "high"];
+export const AGY_EFFORT_ORDER: readonly AgyEffort[] = ["low", "medium", "high", "xhigh"];
 
 /** Map pi's thinking level onto one of the tiers `efforts` the base actually
  *  supports, clamping to the nearest available. agy rejects an effort tier a
@@ -63,9 +60,11 @@ export function toAgyEffort(
 			candidate = "medium";
 			break;
 		case "high":
+			candidate = "high";
+			break;
 		case "xhigh":
 		case "max":
-			candidate = "high";
+			candidate = "xhigh";
 			break;
 		default:
 			candidate = efforts[0] ?? "low";
@@ -81,11 +80,8 @@ export function toAgyEffort(
 	return efforts[0] ?? "low";
 }
 
-/** Split an agy slug into (base, tier). tier is null when the slug has no
- *  -high/-medium/-low suffix - a shape only unverified families should
- *  produce now, and those stay whole. Every Claude slug carries a tier
- *  suffix and collapses to its base. */
-const TIER_RE = /^(.+)-(high|medium|low)$/;
+/** Split a recognized effort suffix from the native model slug. */
+const TIER_RE = /^(.+)-(xhigh|high|medium|low)$/;
 
 /** agy emits clean slug ids (gemini-3.6-flash-high). Validate col1 of each
  *  line so a banner / auth / "Fetching models…" line can't register as a
@@ -322,9 +318,15 @@ export function entriesFromRaw(raw: string): AgyModelEntry[] {
 	}
 	const entries: AgyModelEntry[] = [];
 	for (const [base, g] of groups) {
-		const efforts = [...g.tiers].sort((a, b) => EFFORT_RANK[a] - EFFORT_RANK[b]);
+		const efforts = AGY_EFFORT_ORDER.filter((tier) => g.tiers.has(tier));
 		if (efforts.length >= 2 && EFFORT_CAPABLE_FAMILIES.some((re) => re.test(base))) {
 			entries.push({ full: base, id: slugify(base), efforts });
+			// Older bridge versions registered this qualified id as a fixed model.
+			// Keep saved selections and sessions using that id resolvable.
+			if (efforts.includes("xhigh")) {
+				const full = `${base}-xhigh`;
+				entries.push({ full, id: slugify(full) });
+			}
 		} else {
 			for (const line of g.lines) entries.push({ full: line, id: slugify(line) });
 		}
@@ -349,14 +351,14 @@ export function slugify(full: string): string {
 
 /** Build the thinkingLevelMap for an effort-driven base: hide "off" and
  *  "minimal" always (agy has no no-thinking mode; a base REQUIRES an effort),
- *  and hide any of low/medium/high the base doesn't offer (e.g. Pro has no
- *  medium). pi's getSupportedThinkingLevels treats a null value as hidden, so
- *  the toggle then shows exactly agy's slider stops. */
+ *  and hide any basic tier the base doesn't offer. Pi requires an explicit
+ *  mapping for extended tiers, even when the native value has the same name. */
 function thinkingLevelMapFor(efforts: readonly AgyEffort[]): ThinkingLevelMap {
 	const map: Record<string, string | null> = { off: null, minimal: null };
 	for (const level of ["low", "medium", "high"] as const) {
 		if (!efforts.includes(level)) map[level] = null;
 	}
+	if (efforts.includes("xhigh")) map.xhigh = "xhigh";
 	return map as ThinkingLevelMap;
 }
 

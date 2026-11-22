@@ -44,7 +44,7 @@ import {
 import { loadConfig, type AgyMode, type ThinkingTier } from "./config.js";
 import { redactText } from "./redact.js";
 import { acquireBridgeSuppression } from "./mcp-registration.js";
-import { AGY_EFFORT_ORDER, spawnAgyModelsRaw, toAgyEffort } from "./models.js";
+import { AGY_EFFORT_ORDER, spawnAgyModelsRaw, toAgyEffort, type AgyEffort } from "./models.js";
 import { sweepStaleWebAgents, webAgentsRoot } from "./web-tools.js";
 
 // --- Constants -------------------------------------------------------------
@@ -63,7 +63,7 @@ COMPACT OUTPUT (param: digest): when true, the prompt is prefixed to request com
 
 THINKING LEVEL (params: thinking, effort - SYNONYMS for one knob):
 - pi calls it thinking, agy calls it effort. Same thing. Pass ONE of the two.
-- Values (pi vocabulary): minimal|low|medium|high|xhigh|max. Clamped to agy's low|medium|high; unknown values fall back to low. "peer review on high thinking" -> thinking: "high".
+- Values (pi vocabulary): minimal|low|medium|high|xhigh|max. Clamped to the model's available tiers; xhigh requires a listed variant. Unknown values fall back to low.
 - An explicit level beats a tier embedded in model ("flash high") and the configured default. Omit both for the configured default.`;
 
 // Delegations legitimately run long (research, review, analysis); a short
@@ -91,6 +91,28 @@ export function toolModelsFromRaw(raw: string): ModelEntry[] {
 				.filter((e): e is ModelEntry => e !== null),
 		),
 	);
+}
+
+export function resolveToolModel(
+	model: string,
+	entries: ModelEntry[],
+	defaultThinking: ThinkingTier,
+	thinking?: ThinkingLevel,
+) {
+	const requestedTier = thinking && toAgyEffort(thinking, AGY_EFFORT_ORDER);
+	const preferred = requestedTier === "xhigh" ? "high" : requestedTier;
+	const resolved = resolveAgyModel(model, entries, defaultThinking, preferred) ?? { model };
+	if (requestedTier === "xhigh") {
+		const qualified = `${resolved.model.toLowerCase()}-xhigh`;
+		const variant = entries.find((entry) => entry.full.toLowerCase() === qualified);
+		// The shared resolver supports the three basic tiers. AGY also accepts
+		// the exact qualified model slug, so no shared-package upgrade is needed.
+		if (variant) return { model: variant.full, thinking: "xhigh" as const };
+	}
+	return {
+		...resolved,
+		thinking: resolved.model.toLowerCase().endsWith("-xhigh") ? "xhigh" as const : (resolved.effort ?? defaultThinking),
+	};
 }
 
 /** Query `agy models` and return tool-catalog entries. Returns [] on failure.
@@ -675,7 +697,7 @@ export async function registerAskAntigravityTool(
 			thinking: Type.Optional(
 				Type.String({
 					description:
-						"Thinking level (= agy effort tier). pi vocabulary: minimal|low|medium|high|xhigh|max, clamped to agy's low|medium|high (unknown values fall back to low). Overrides a tier embedded in `model`. Omit for the configured default.",
+						"Thinking level (= agy effort tier). Pi vocabulary: minimal|low|medium|high|xhigh|max, clamped to the model's available tiers. Unknown values fall back to low. Overrides a tier embedded in `model`. Omit for the configured default.",
 				}),
 			),
 			effort: Type.Optional(
@@ -724,14 +746,7 @@ export async function registerAskAntigravityTool(
 			const cfg = loadConfig();
 			const requestedModel = (args.model as string | undefined)?.trim() || cfg.defaultModel;
 			const thinkingArg = (args.thinking as string | undefined) ?? (args.effort as string | undefined);
-			const resolved =
-				resolveAgyModel(
-					requestedModel,
-					entries,
-					cfg.defaultThinking,
-					thinkingArg ? toAgyEffort(thinkingArg as ThinkingLevel, AGY_EFFORT_ORDER) : undefined,
-				) ?? { model: requestedModel };
-			const thinking: ThinkingTier = resolved.effort ?? cfg.defaultThinking;
+			const resolved = resolveToolModel(requestedModel, entries, cfg.defaultThinking, thinkingArg as ThinkingLevel | undefined);
 			// Same default rule as execute: plan when the configured mode is
 			// plan, so the row always names what will actually run.
 			const mode: AgyMode =
@@ -740,7 +755,7 @@ export async function registerAskAntigravityTool(
 			const isContinue =
 				typeof args.conversationId === "string" && CONV_ID_RE.test(args.conversationId);
 
-			const tags: string[] = [`model=${resolved.model}`, `thinking=${thinking}`];
+			const tags: string[] = [`model=${resolved.model}`, `thinking=${resolved.thinking}`];
 			if (mode !== "accept-edits") tags.push(`mode=${mode}`);
 			if (useDigest) tags.push("digest");
 			if (isContinue) tags.push("continue");
@@ -853,13 +868,7 @@ export async function registerAskAntigravityTool(
 				};
 			}
 			const thinkingArg = (params.thinking as string | undefined) ?? (params.effort as string | undefined);
-			const preferredTier = thinkingArg
-				? toAgyEffort(thinkingArg as ThinkingLevel, AGY_EFFORT_ORDER)
-				: undefined;
-			const resolved =
-				resolveAgyModel(requestedModel, entries, config.defaultThinking, preferredTier) ?? {
-					model: requestedModel,
-				};
+			const resolved = resolveToolModel(requestedModel, entries, config.defaultThinking, thinkingArg as ThinkingLevel | undefined);
 
 			const start = Date.now();
 			const cwd = params.cwd || ctx.cwd || process.cwd();
@@ -949,7 +958,7 @@ export async function registerAskAntigravityTool(
 
 			log?.(
 				"ask-start",
-				{ model: resolved.model, thinking: resolved.effort ?? config.defaultThinking, mode, digest: useDigest, continue: isContinuation, timeoutMin, background: false },
+				{ model: resolved.model, thinking: resolved.thinking, mode, digest: useDigest, continue: isContinuation, timeoutMin, background: false },
 				"info",
 			);
 			// Build argv via the shared peer adapter (see buildAgyArgs there for
@@ -972,7 +981,7 @@ export async function registerAskAntigravityTool(
 			const details: AgyDetails = {
 				model: requestedModel,
 				resolvedModel: resolved.model,
-				thinking: resolved.effort ?? config.defaultThinking,
+				thinking: resolved.thinking,
 				mode,
 				digest: useDigest,
 				conversationId: isContinuation ? (rawConvId as string) : null,
@@ -1179,7 +1188,7 @@ function askContextDir(): string {
 interface AgyDetails {
 	model: string | null;
 	resolvedModel: string | null;
-	thinking: ThinkingTier | null;
+	thinking: AgyEffort | null;
 	mode: AgyMode;
 	digest: boolean;
 	conversationId: string | null;
@@ -1200,7 +1209,7 @@ interface AgyDetails {
 function emptyDetails(
 	model: string | null = null,
 	resolvedModel: string | null = null,
-	thinking: ThinkingTier | null = null,
+	thinking: AgyEffort | null = null,
 	includeContext: boolean = false,
 ): AgyDetails {
 	return {
