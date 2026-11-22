@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.10.12] - 2026-11-22
+
+### Fixed
+
+- Expose the `xhigh` thinking level on models that list it in `agy models`, including Gemini 4 Neon and Hydrogen. Pi provider turns and `AskAntigravity` now use the native tier. Existing qualified model IDs remain available for saved sessions.
+
 ## [1.10.11] - 2026-11-22
 
 ### Fixed
