@@ -211,7 +211,7 @@ export const ACP_BRIDGE_NOTE =
 
 /** Build the restricted ACP carrier agent body: optional Pi system prompt
  *  (omitted when config.systemPrompt is false), the bridge protocol note, and
- *  the live pi-bridge tool catalog with explicit call_mcp_tool instructions.
+ *  the live pi-bridge tool catalog with instructions for direct and dispatched calls.
  *  Exported for pure unit verification; included in the carrier hash so any
  *  catalog or prompt change stages a distinct agent name and recycles ACP. */
 export function buildAcpAgentBody(
@@ -238,12 +238,12 @@ export function buildAcpAgentBody(
 			parts.push(
 				[
 					"# Pi Bridge Tool Protocol",
-					'Invoke Pi bridge tools using the native `call_mcp_tool` function with `ServerName` set to `"pi-bridge"`, `ToolName` set to one of the tool names listed below, and `Arguments` set to a JSON object matching that tool\'s JSON Schema.',
-					"- Use the `pi-bridge` catalog tools directly via `call_mcp_tool` for files, commands, skills, and user interactions.",
-					"- Do NOT call `list_resources`, `read_resource`, or `manage_task`, and do NOT write textual tool call tags; preserve native `call_mcp_tool` function calls.",
+					`Use the direct \`mcp_pi-bridge_${codeModeOnly ? CODEMODE_TOOL_NAME : "<tool>"}\` when offered in the current tool declarations. Pass the listed tool arguments directly.`,
+					'If only `call_mcp_tool` is offered, set `ServerName` to `"pi-bridge"`, `ToolName` to the listed tool name, and `Arguments` to the object matching its JSON Schema.',
+					"- Use actual function calls, not textual tool tags. Do NOT call `list_resources`, `read_resource`, or `manage_task`.",
 					codeModeOnly
-						? `- If codemode answers STILL RUNNING with a callId, call codemode again with Arguments: {"${CODEMODE_POLL_ARG}": "..."} (no code) until the final result arrives.`
-						: '- If a `pi-bridge` call answers `STILL RUNNING` with a `callId`, poll `call_mcp_tool` with `ServerName: "pi-bridge"`, `ToolName: "bridge_poll_result"`, and `Arguments: {"callId": "..."}` until the final result arrives.',
+						? `- If codemode answers STILL RUNNING with a callId, call it again through the same entry point with {"${CODEMODE_POLL_ARG}": "..."} as its tool arguments (no code) until the final result arrives.`
+						: '- If a `pi-bridge` call answers `STILL RUNNING` with a `callId`, call the listed `bridge_poll_result` tool with `{"callId": "..."}` using the same convention until the final result arrives.',
 					"",
 					"## Available `pi-bridge` Tools",
 					"",
@@ -702,7 +702,7 @@ export class EscalationRegistry {
 
 export function formatEscalatedAck(e: BridgeEscalation, codeModeOnly = false): BridgeCallResultShape {
 	const pollCommand = codeModeOnly
-		? `${CODEMODE_TOOL_NAME} with Arguments: ${JSON.stringify({ [CODEMODE_POLL_ARG]: e.callId })} (no code)`
+		? `${CODEMODE_TOOL_NAME} again through the same entry point, with ${JSON.stringify({ [CODEMODE_POLL_ARG]: e.callId })} as its tool arguments (no code)`
 		: `${POLL_TOOL_NAME} with callId "${e.callId}"`;
 	return {
 		content: [

@@ -20,15 +20,21 @@ function invoke(hook: AcpRecallHook, conversationId: string, extraEnv: Record<st
 	});
 }
 
-test("the private Code Mode policy allows only pi-bridge codemode dispatch", () => {
+test("the private Code Mode policy allows both dispatch forms only for pi-bridge codemode", () => {
 	const decision = (toolCall: object) => JSON.parse(execFileSync(
 		process.execPath, [client, "--codemode-only"],
 		{ input: JSON.stringify({ hookEventName: "PreToolUse", toolCall }), encoding: "utf8" },
 	)).decision;
 	const dispatch = { name: "call_mcp_tool", args: { ServerName: "pi-bridge", ToolName: "codemode" } };
 	assert.equal(decision(dispatch), "allow");
+	const direct = { name: "mcp_pi-bridge_codemode" };
+	assert.equal(decision({ ...direct, args: { code: "text(1)" } }), "allow");
+	assert.equal(decision({ ...direct, args: { pollCallId: "call-id" } }), "allow");
 	assert.equal(decision({ ...dispatch, args: { ...dispatch.args, ToolName: "bridge_poll_result" } }), "deny");
 	assert.equal(decision({ ...dispatch, args: { ...dispatch.args, ServerName: "other-mcp" } }), "deny");
+	assert.equal(decision({ name: "mcp_other-mcp_codemode" }), "deny");
+	assert.equal(decision({ name: "mcp_pi-bridge_bridge_poll_result" }), "deny");
+	assert.equal(decision({ name: "codemode" }), "deny");
 	assert.equal(decision({ name: "list_resources" }), "deny");
 	assert.equal(decision({ name: "manage_task" }), "deny");
 });

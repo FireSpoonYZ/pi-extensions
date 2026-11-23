@@ -54,8 +54,11 @@ describe("live Pi bridge catalog", () => {
 		}])).toEqual([]);
 
 		const body = buildAcpAgentBody(undefined, catalog, true);
+		expect(body).toContain("`mcp_pi-bridge_codemode` when offered");
+		expect(body).toContain("If only `call_mcp_tool` is offered");
 		expect(body).toContain(CODEMODE_POLL_ARG);
 		expect(body).not.toContain("bridge_poll_result");
+		expect(buildAcpAgentBody(undefined, [], true)).not.toContain("mcp_pi-bridge_codemode");
 		const escalation = { escalated: true, name: "codemode", callId: "test-id" } as const;
 		expect(JSON.stringify(formatEscalatedAck(escalation, true))).not.toContain("bridge_poll_result");
 		expect(JSON.stringify(formatEscalatedAck(escalation, true))).toContain(CODEMODE_POLL_ARG);

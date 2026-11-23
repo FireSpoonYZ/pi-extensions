@@ -59,9 +59,12 @@ async function recall() {
 async function codeModeToolDecision() {
 	const input = await readBounded(process.stdin, MAX_HOOK_INPUT_BYTES);
 	const { toolCall } = JSON.parse(input?.toString("utf8") ?? "{}") ?? {};
-	if (toolCall?.name === "call_mcp_tool" &&
+	// ACP can register the same private MCP tool directly after session/load.
+	const direct = toolCall?.name === "mcp_pi-bridge_codemode";
+	const dispatched = toolCall?.name === "call_mcp_tool" &&
 		toolCall.args?.ServerName === "pi-bridge" &&
-		toolCall.args?.ToolName === "codemode") {
+		toolCall.args?.ToolName === "codemode";
+	if (direct || dispatched) {
 		return JSON.stringify({ decision: "allow" });
 	}
 }
