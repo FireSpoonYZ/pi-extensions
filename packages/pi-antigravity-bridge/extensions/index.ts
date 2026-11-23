@@ -27,7 +27,6 @@ import {
 	createEditToolDefinition,
 	createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { getCurrentTools } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { DIALOG_OPTIONS, DialogMenu, dialogBlocked, type DialogRow } from "@estebanforge/pi-tui-dialogs";
 import {
@@ -101,7 +100,7 @@ import {
 	type SkillLite,
 } from "../src/skills.js";
 import { mapAgyToolToNative } from "../src/native-tools.js";
-import { BRIDGE_POLL_TOOL, bridgedPiTools, projectCodeModeOnlyTools, toBridgeCatalog } from "../src/bridge-catalog.js";
+import { BRIDGE_POLL_TOOL, CODEMODE_POLL_ARG, CODEMODE_TOOL_NAME, acpCodeModeCatalog, bridgedPiTools, toBridgeCatalog } from "../src/bridge-catalog.js";
 import { Type } from "typebox";
 import { patchStatus, restorePatch } from "../src/patch-cleanup.js";
 import { withDialogLock } from "../src/dialog-lock.js";
@@ -205,15 +204,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	// Session-only visibility overrides; never change either application's MCP config.
 	const hiddenBridgeTools = new Set<string>();
 	const getBridgeTools = () => bridgedPiTools(pi.getAllTools(), pi.getActiveTools(), loadConfig().bridgeTools, hiddenBridgeTools);
-	const codeModeOnly = () => pi.getSettings().codemode?.mode === "only" && pi.getActiveTools().includes("codemode");
-	const allowedAcpNames = () => new Set((mcpHandle ? getBridgeTools() : []).map(({ name }) => name));
-	pi.on("context_with_system", (event, ctx) => {
-		if (!codeModeOnly()) return;
-		const modelOnlyNames = new Set(pi.getAllTools().filter((tool) => tool.exposure === "model-only").map(({ name }) => name));
-		const acp = engine === "acp" && ctx.model?.provider === "antigravity";
-		const messages = projectCodeModeOnlyTools(event.messages, modelOnlyNames, acp ? allowedAcpNames() : undefined);
-		return messages ? { messages } : undefined;
-	});
+	const codeModeOnly = () => pi.getSettings().codemode?.mode === "only" && pi.getActiveTools().includes(CODEMODE_TOOL_NAME);
 	// Populated on session_start once ctx.isProjectTrusted() is known; empty before start.
 	let bridgeSkills: SkillLite[] = [];
 	const listTools = () => {
@@ -393,6 +384,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			];
 		},
 	});
+	// Never fall back to the full live catalog before the first strict prompt.
+	const getAcpCatalog = () => engine === "acp" ? acpDriver.toolCatalog ?? (codeModeOnly() ? [] : undefined) : undefined;
 	// The active engine is resolved from the latched load-time value.
 	const activeDriver = (): TurnDriver => (engine === "acp" ? acpDriver : streamDriver);
 	// The provider's stream-json slot gets the STREAM driver explicitly - never
@@ -645,10 +638,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		bridgeCatalog: () => (mcpHandle && loadConfig().bridgeTools !== "none" ? listTools() : []),
 		acpToolCatalog: (context) => {
 			if (!codeModeOnly()) return undefined;
-			const allowed = allowedAcpNames();
-			const tools = getCurrentTools(context.messages).filter(({ name }) =>
-				allowed.has(name) || (name === POLL_TOOL_NAME && allowed.size > 0));
-			return toBridgeCatalog(tools);
+			if (!mcpHandle || !getBridgeTools().some(({ name }) => name === CODEMODE_TOOL_NAME)) return [];
+			return acpCodeModeCatalog(context.messages);
 		},
 		projectHindsightRecall: engine === "acp" ? registerHindsightRecall(pi) : undefined,
 		engine,
@@ -916,16 +907,27 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			args: Record<string, unknown>,
 			signal: AbortSignal,
 		) => {
-			const catalog = engine === "acp" ? acpDriver.toolCatalog : undefined;
+			const catalog = getAcpCatalog();
 			if (catalog && !catalog.some((tool) => tool.name === name)) {
 				return Promise.resolve({ content: [{ type: "text", text: `Pi tool ${name} was not declared for this ACP prompt` }], isError: true });
 			}
-			// Bridge-local, like activate_skill: answered from the escalation
-			// registry, never parked into pi.
-			if (name === POLL_TOOL_NAME) {
-				const wanted = typeof args.callId === "string" ? args.callId : "";
+			// A cached MCP catalog is not authorization. Recheck live visibility
+			// for Pi tools before either executing a script or polling its result.
+			if (name !== POLL_TOOL_NAME && name !== ACTIVATE_SKILL_TOOL_NAME && !getBridgeTools().some((tool) => tool.name === name)) {
+				return Promise.resolve({ content: [{ type: "text", text: `Pi tool ${name} is not active or not exposed to Antigravity` }], isError: true });
+			}
+			// On strict ACP turns, polling is a transport operation of codemode,
+			// not a second tool or a script sent to Pi.
+			const codeModePoll = catalog !== undefined && name === CODEMODE_TOOL_NAME && Object.hasOwn(args, CODEMODE_POLL_ARG);
+			if (name === POLL_TOOL_NAME || codeModePoll) {
+				const callIdArg = args[codeModePoll ? CODEMODE_POLL_ARG : "callId"];
+				const wanted = typeof callIdArg === "string" ? callIdArg : "";
+				if (codeModePoll && (!wanted || Object.keys(args).length !== 1)) {
+					return Promise.resolve({ content: [{ type: "text", text: `Use ${CODEMODE_POLL_ARG} alone to poll ${CODEMODE_TOOL_NAME}` }], isError: true });
+				}
 				mcpLog("poll-tool", { callId: wanted });
-				const view = roundTrips.poll(wanted);
+				const result = roundTrips.poll(wanted);
+				const view = codeModePoll && result?.name !== CODEMODE_TOOL_NAME ? undefined : result;
 				// A terminal answer means the model RECEIVED the result; mark it
 				// so the redelivery path never double-delivers. poll() itself
 				// stays pure (internal peeks must not mark). Accepted gap: the
@@ -936,17 +938,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				return Promise.resolve(formatPollAnswer(wanted, view));
 			}
 			if (name !== ACTIVATE_SKILL_TOOL_NAME) {
-				// A cached MCP catalog is not authorization. An inactive/hidden tool
-				// must not get parked into Pi, even if agy retained its old schema.
-				if (!getBridgeTools().some((tool) => tool.name === name)) {
-					return Promise.resolve({ content: [{ type: "text", text: `Pi tool ${name} is not active or not exposed to Antigravity` }], isError: true });
-				}
 				return roundTrips.onToolCall(callId, name, args, signal).then((r) => {
 					// Early-ack: answer the HTTP request before agy's ~180s client
 					// deadline with a poll handle; pi keeps executing meanwhile.
 					if (!("escalated" in r)) return r;
 					mcpLog("call-tool-escalated", { name, callId: r.callId });
-					return formatEscalatedAck(r);
+					return formatEscalatedAck(r, catalog !== undefined);
 				});
 			}
 			const wanted = typeof args.name === "string" ? args.name : "";
@@ -965,7 +962,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		const r = await startMcpServer(
 			{
 				listTools: () => {
-					const catalog = engine === "acp" ? acpDriver.toolCatalog : undefined;
+					const catalog = getAcpCatalog();
 					return loadConfig().bridgeTools === "none" ? [] : (catalog ? [...catalog] : listTools());
 				},
 				onToolCall: bridgeOnToolCall,

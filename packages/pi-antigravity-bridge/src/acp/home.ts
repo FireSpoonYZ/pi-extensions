@@ -82,10 +82,16 @@ function recallManifestMatches(file: string, content: string): boolean {
 
 /** AGY retains the resolved hook path with the conversation. Keep the static
  *  handler definition outside the per-spawn home that holds MCP credentials. */
-function stageRecallManifest(parentDir: string, stagedHome: string, command: string): string {
+function stageRecallManifest(parentDir: string, stagedHome: string, command: string, codeModeOnly = false): string {
 	const content = JSON.stringify({
 		[ACP_RECALL_HOOK_NAME]: {
 			PreInvocation: [{ type: "command", command, timeout: 3 }],
+			...(codeModeOnly ? {
+				PreToolUse: [{
+					matcher: ".*",
+					hooks: [{ type: "command", command: `${command} --codemode-only`, timeout: 3 }],
+				}],
+			} : {}),
 		},
 	});
 	const hash = createHash("sha256").update(content).digest("hex");
@@ -159,6 +165,8 @@ export interface StageAgyHomeOptions {
 	agentMcpServers?: AgentMcpServerSpec[];
 	/** Bridge-owned PreInvocation handler for the private carrier. */
 	agentRecallHookCommand?: string;
+	/** Guard AGY's retained native tools in an ACP Code Mode only carrier. */
+	codeModeOnly?: boolean;
 }
 
 /** Isolate a spawned agy from per-pid bridge entries in the global MCP
@@ -243,7 +251,7 @@ export function stageAgyHome(opts: StageAgyHomeOptions = {}): string {
 			fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
 			const rawAgentMd = fs.readFileSync(carrierMd, "utf8");
 			const recallManifest = opts.agentRecallHookCommand
-				? stageRecallManifest(parentDir, staged, opts.agentRecallHookCommand)
+				? stageRecallManifest(parentDir, staged, opts.agentRecallHookCommand, opts.codeModeOnly)
 				: undefined;
 			const recallHookPath = recallManifest
 				? path.relative(targetDir, recallManifest).split(path.sep).join("/")

@@ -254,7 +254,16 @@ test("a fresh carrier persists the native conversation and only its empty hook d
 	const hooks = JSON.parse(fs.readFileSync(hookFile, "utf8"));
 	assert.deepEqual(Object.keys(hooks), ["pi-bridge-turn-recall"]);
 	assert.equal(hooks["pi-bridge-turn-recall"].PreInvocation[0].command, "bridge-owned-command");
+	assert.equal(hooks["pi-bridge-turn-recall"].PreToolUse, undefined);
 	assert.ok(stagedMd.includes("private-test"));
+
+	const strict = stageAgyHome({ ...enabledOpts, codeModeOnly: true });
+	const strictCarrier = path.join(strict, privateCarrier);
+	const strictEntry = /hooks:\s+- ("[^"\n]+")/.exec(fs.readFileSync(path.join(strictCarrier, "agent.md"), "utf8"));
+	assert.ok(strictEntry);
+	const strictHooks = JSON.parse(fs.readFileSync(path.resolve(strictCarrier, JSON.parse(strictEntry[1])), "utf8"));
+	assert.equal(strictHooks["pi-bridge-turn-recall"].PreToolUse[0].hooks[0].command, "bridge-owned-command --codemode-only");
+	removeStagedAgyHome(strict);
 	markStagedAgyHomeSessionCreated(enabled, agent);
 	removeStagedAgyHome(enabled);
 	assert.ok(fs.existsSync(hookFile));

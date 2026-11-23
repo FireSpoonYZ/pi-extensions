@@ -34,7 +34,7 @@ import {
 import fs from "node:fs";
 import type { Api } from "@earendil-works/pi-ai";
 import type { DriverActivity, TurnDriver, TurnHandle } from "./driver-types.js";
-import { POLL_TOOL_NAME, type BridgeCatalogEntry } from "./bridge-catalog.js";
+import { CODEMODE_POLL_ARG, CODEMODE_TOOL_NAME, POLL_TOOL_NAME, type BridgeCatalogEntry } from "./bridge-catalog.js";
 import { looksBackgroundNativeCall } from "./background-watch.js";
 import { SubagentRoster } from "./subagent-roster.js";
 import { toPiUsage } from "./stream-events.js";
@@ -223,9 +223,10 @@ export function buildAcpAgentBody(
 	if (systemPrompt) {
 		parts.push(SYSTEM_PROMPT_PREAMBLE, systemPrompt, SYSTEM_PROMPT_END);
 	}
-	parts.push(ACP_BRIDGE_NOTE);
-	if (codeModeOnly && catalog?.some(({ name }) => name === "codemode")) {
-		parts.push("In Code Mode only, use codemode with searchTools(), describeTool(), and tools.* to discover and execute tools not declared below. Do not look for a separate tool_search.");
+	if (codeModeOnly) {
+		parts.push("In Code Mode only, codemode is the sole Pi tool. Use searchTools(), describeTool(), and tools.* inside its scripts for files, commands, skills, and other capabilities. Do not call other tools directly or use native agy tools instead.");
+	} else {
+		parts.push(ACP_BRIDGE_NOTE);
 	}
 	if (catalog !== undefined) {
 		if (catalog.length > 0) {
@@ -240,7 +241,9 @@ export function buildAcpAgentBody(
 					'Invoke Pi bridge tools using the native `call_mcp_tool` function with `ServerName` set to `"pi-bridge"`, `ToolName` set to one of the tool names listed below, and `Arguments` set to a JSON object matching that tool\'s JSON Schema.',
 					"- Use the `pi-bridge` catalog tools directly via `call_mcp_tool` for files, commands, skills, and user interactions.",
 					"- Do NOT call `list_resources`, `read_resource`, or `manage_task`, and do NOT write textual tool call tags; preserve native `call_mcp_tool` function calls.",
-					'- If a `pi-bridge` call answers `STILL RUNNING` with a `callId`, poll `call_mcp_tool` with `ServerName: "pi-bridge"`, `ToolName: "bridge_poll_result"`, and `Arguments: {"callId": "..."}` until the final result arrives.',
+					codeModeOnly
+						? `- If codemode answers STILL RUNNING with a callId, call codemode again with Arguments: {"${CODEMODE_POLL_ARG}": "..."} (no code) until the final result arrives.`
+						: '- If a `pi-bridge` call answers `STILL RUNNING` with a `callId`, poll `call_mcp_tool` with `ServerName: "pi-bridge"`, `ToolName: "bridge_poll_result"`, and `Arguments: {"callId": "..."}` until the final result arrives.',
 					"",
 					"## Available `pi-bridge` Tools",
 					"",
@@ -697,14 +700,17 @@ export class EscalationRegistry {
 	}
 }
 
-export function formatEscalatedAck(e: BridgeEscalation): BridgeCallResultShape {
+export function formatEscalatedAck(e: BridgeEscalation, codeModeOnly = false): BridgeCallResultShape {
+	const pollCommand = codeModeOnly
+		? `${CODEMODE_TOOL_NAME} with Arguments: ${JSON.stringify({ [CODEMODE_POLL_ARG]: e.callId })} (no code)`
+		: `${POLL_TOOL_NAME} with callId "${e.callId}"`;
 	return {
 		content: [
 			{
 				type: "text",
 				text: [
 					`STILL RUNNING: the pi tool "${e.name}" has not finished yet.`,
-					`Call ${POLL_TOOL_NAME} with callId "${e.callId}" to get the result. Poll again if it still reports running; you may do other work between polls.`,
+					`Call ${pollCommand} to get the result. Poll again if it still reports running; you may do other work between polls.`,
 					"Do NOT end your turn while this call is unresolved: keep polling until it reports done or failed. Ending the turn strands the result.",
 				].join("\n"),
 			},
@@ -1438,11 +1444,15 @@ async function runTurnDriver(
 	const blocks: BlockState = { partial, textIdx: null, thinkingIdx: null, started: false };
 
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-	const preferredKey = sessionKey(options, cwd, deps.engine, deps.recallSessions);
-	const legacyKey = deps.recallSessions ? sessionKey(options, cwd, deps.engine) : preferredKey;
+	const codeModeOnly = deps.toolCatalog !== undefined;
+	const pollTool = codeModeOnly ? CODEMODE_TOOL_NAME : POLL_TOOL_NAME;
+	const ordinaryKey = sessionKey(options, cwd, deps.engine, deps.recallSessions);
+	// ACP persists the carrier and hook selection with the native conversation.
+	const preferredKey = codeModeOnly ? `${ordinaryKey}-codemode-only` : ordinaryKey;
+	const legacyKey = deps.recallSessions ? sessionKey(options, cwd, deps.engine) : ordinaryKey;
 	let key = preferredKey;
 	let existing = store.get(key);
-	if (!existing && key !== legacyKey) {
+	if (!codeModeOnly && !existing && key !== legacyKey) {
 		const legacy = store.get(legacyKey);
 		if (legacy) {
 			key = legacyKey;
@@ -1516,7 +1526,7 @@ async function runTurnDriver(
 			return {
 				callId: view.callId,
 				name: view.name,
-				reason: "you never received this result: you ended your turn without calling bridge_poll_result",
+				reason: `you never received this result: you ended your turn without calling ${pollTool}`,
 				text: view.text ?? "(no output)",
 				isError: view.isError ?? false,
 				images: view.images,
@@ -1555,7 +1565,7 @@ async function runTurnDriver(
 		const acpSysPrompt = config.systemPrompt
 			? adaptPiSystemPrompt(getCurrentSystemPrompt(context.messages)) || undefined
 			: undefined;
-		const body = buildAcpAgentBody(acpSysPrompt, deps.toolCatalog ?? deps.bridgeCatalog?.(), deps.toolCatalog !== undefined);
+		const body = buildAcpAgentBody(acpSysPrompt, deps.toolCatalog ?? deps.bridgeCatalog?.(), codeModeOnly);
 		return stageSyspromptAgent(body, { acp: true });
 	};
 	const active = isContinuation ? deps.driver.reentry() : null;
@@ -1575,7 +1585,7 @@ async function runTurnDriver(
 			}
 			// Escalated results, all already delivered through polls: the model
 			// has them in context. Settle quietly instead of erroring.
-			appendText(stream, blocks, `[bridge] ${escalatedNames.join(", ")} finished; the result is available via ${POLL_TOOL_NAME}.`);
+			appendText(stream, blocks, `[bridge] ${escalatedNames.join(", ")} finished; the result is available via ${pollTool}.`);
 			finalize(stream, blocks, "stop");
 			return;
 		}
@@ -1586,7 +1596,7 @@ async function runTurnDriver(
 			// claims and settle quietly; the result stays pollable and a later
 			// pass with a bound conversation can still sweep it.
 			for (const l of late) if (l.callId) deps.roundTrips.unclaim(l.callId);
-			appendText(stream, blocks, `[bridge] ${escalatedNames.join(", ")} finished, but no conversation is bound to re-deliver into; the result stays available via ${POLL_TOOL_NAME}.`);
+			appendText(stream, blocks, `[bridge] ${escalatedNames.join(", ")} finished, but no conversation is bound to re-deliver into; the result stays available via ${pollTool}.`);
 			finalize(stream, blocks, "stop");
 			return;
 		}
@@ -1630,7 +1640,8 @@ async function runTurnDriver(
 		const awaitingLegacyResult = legacyTombstones?.size && context.messages.some((message) =>
 			message.role === "assistant" && message.content.some((part) => part.type === "toolCall" && legacyTombstones.has(part.id)),
 		);
-		const migrating = canMigrate && !awaitingLegacyResult;
+		const migrating = (canMigrate && !awaitingLegacyResult) ||
+			(codeModeOnly && !existing && !isContinuation && late.length === 0 && Boolean(store.get(ordinaryKey) ?? store.get(legacyKey)));
 		let migrationContext: { uri: string; text: string } | undefined;
 		if (migrating) {
 			const history = buildContextDigest(context.messages.slice(0, -1), 0, {
@@ -1737,7 +1748,7 @@ async function runTurnDriver(
 				skipPermissions: config.skipPermissions,
 				timeoutMin: config.turnTimeoutMin,
 				inactivityMin: config.inactivityTimeoutMin,
-				conversationId: redeliveryConversation ?? existing?.conversationId ?? null,
+				conversationId: (codeModeOnly ? existing?.conversationId : redeliveryConversation ?? existing?.conversationId) ?? null,
 				toolCatalog: deps.toolCatalog,
 				prompt: fullPrompt,
 				images: runImages.length > 0 ? runImages : undefined,
@@ -1866,7 +1877,7 @@ async function runTurnDriver(
 	if (isContinuation && outcome.status === "OK" && !outcome.aborted) {
 		const more = collectStranded();
 		if (more.length > 0) {
-			const conv = redeliveryConversation ?? outcome.conversationId ?? existing?.conversationId ?? null;
+			const conv = (codeModeOnly ? undefined : redeliveryConversation) ?? outcome.conversationId ?? existing?.conversationId ?? null;
 			let lateAgent: string | undefined;
 			if (deps.engine === "acp") {
 				const staged = resolveAcpAgent();

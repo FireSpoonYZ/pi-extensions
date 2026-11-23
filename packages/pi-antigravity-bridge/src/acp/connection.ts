@@ -57,6 +57,8 @@ export interface AcpConnectionOptions {
 	includeDefaultCustomizations?: boolean;
 	/** Enable the bridge-owned hook in the isolated provider carrier. */
 	enableTurnRecall?: boolean;
+	/** Deny native actions other than MCP dispatch in the private carrier. */
+	codeModeOnly?: boolean;
 	/** Explicit agent discovery root for isolated home staging (tests). */
 	agentsRoot?: string;
 	extraEnv?: Record<string, string>;
@@ -235,6 +237,7 @@ export class AcpConnection {
 					...(this.#opts.agentsRoot ? { agentsRoot: this.#opts.agentsRoot } : {}),
 					...(agentMcpServers ? { agentMcpServers } : {}),
 					agentRecallHookCommand: recallCommand,
+					codeModeOnly: this.#opts.codeModeOnly,
 				});
 				args.push("--gemini-dir", this.#stagedHome);
 			}

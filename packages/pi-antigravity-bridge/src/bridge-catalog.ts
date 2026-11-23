@@ -1,7 +1,8 @@
-import { getCurrentTools, type SystemMessage, type Tool } from "@earendil-works/pi-ai";
-import type { ContextWithSystemEvent } from "@earendil-works/pi-coding-agent";
+import { getCurrentTools, type Tool, type TranscriptContext } from "@earendil-works/pi-ai";
 import type { BridgeTools } from "./config.js";
 
+export const CODEMODE_TOOL_NAME = "codemode";
+export const CODEMODE_POLL_ARG = "pollCallId";
 export const POLL_TOOL_NAME = "bridge_poll_result";
 export const BRIDGE_POLL_TOOL: Tool = {
 	name: POLL_TOOL_NAME,
@@ -23,36 +24,23 @@ export function toBridgeCatalog(tools: readonly Tool[]): BridgeCatalogEntry[] {
 	return tools.map(({ name, description, parameters }) => ({ name, description, inputSchema: parameters }));
 }
 
-/** Change Pi's request, not its active/callable set: Code Mode still needs the hidden tools. */
-export function projectCodeModeOnlyTools(
-	messages: ContextWithSystemEvent["messages"],
-	modelOnlyNames: ReadonlySet<string>,
-	allowedAcpNames?: ReadonlySet<string>,
-): ContextWithSystemEvent["messages"] | undefined {
-	const systems = messages.filter((message): message is SystemMessage => message.role === "system");
-	const system = systems.at(-1);
-	if (!system) return undefined;
-	const tools = getCurrentTools(systems);
-	if (!tools.some((tool) => tool.name === "codemode")) return undefined;
-	const removed = tools.filter(({ name }) =>
-		(name !== "codemode" && (name === "tool_search" || !modelOnlyNames.has(name))) ||
-		(allowedAcpNames !== undefined && !allowedAcpNames.has(name)));
-	const addPoll = allowedAcpNames !== undefined && tools.length > removed.length;
-	if (!removed.length && !addPoll) return undefined;
-
-	const index = messages.lastIndexOf(system);
-	const removedNames = new Set(removed.map(({ name }) => name));
-	const next = messages.slice();
-	// Patch the last declaration delta without changing the user/tool-result tail.
-	next[index] = {
-		...system,
-		toolsRemoved: [...(system.toolsRemoved ?? []), ...removed.map(({ name }) => ({ name }))],
-		toolsAdded: [
-			...(system.toolsAdded ?? []).filter(({ name }) => !removedNames.has(name)),
-			...(addPoll ? [BRIDGE_POLL_TOOL] : []),
-		],
-	};
-	return next;
+/** Project only the ACP MCP request. Pi's declaration and execution allowlists stay intact. */
+export function acpCodeModeCatalog(messages: TranscriptContext["messages"]): BridgeCatalogEntry[] {
+	const tool = getCurrentTools(messages).find(({ name }) => name === CODEMODE_TOOL_NAME);
+	if (!tool) return [];
+	return [{
+		name: tool.name,
+		description: tool.description,
+		inputSchema: {
+			type: "object",
+			properties: {
+				...(tool.parameters as { properties?: object }).properties,
+				[CODEMODE_POLL_ARG]: { type: "string", description: "Call ID from a STILL RUNNING response. Omit code when polling." },
+			},
+			oneOf: [{ required: ["code"] }, { required: [CODEMODE_POLL_ARG] }],
+			additionalProperties: false,
+		},
+	}];
 }
 
 export interface BridgeToolInfo {

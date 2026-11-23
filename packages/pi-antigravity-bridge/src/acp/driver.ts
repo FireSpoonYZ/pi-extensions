@@ -591,6 +591,7 @@ export class AcpDriver implements TurnDriver {
 			// agy pins the hook list when the session is created. Prepare it
 			// even when this turn has no recall, so later turns can use it.
 			enableTurnRecall: request.agent?.startsWith(SYS_AGENT_PREFIX),
+			codeModeOnly: request.toolCatalog !== undefined,
 			agentsRoot: this.#opts.agentsRoot,
 			extraEnv: this.#opts.extraEnv,
 			cwd: request.cwd,

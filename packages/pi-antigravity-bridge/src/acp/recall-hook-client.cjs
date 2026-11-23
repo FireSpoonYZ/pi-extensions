@@ -56,5 +56,23 @@ async function recall() {
 	}
 }
 
+async function codeModeToolDecision() {
+	const input = await readBounded(process.stdin, MAX_HOOK_INPUT_BYTES);
+	const { toolCall } = JSON.parse(input?.toString("utf8") ?? "{}") ?? {};
+	if (toolCall?.name === "call_mcp_tool" &&
+		toolCall.args?.ServerName === "pi-bridge" &&
+		toolCall.args?.ToolName === "codemode") {
+		return JSON.stringify({ decision: "allow" });
+	}
+}
+
 process.stdout.on("error", () => {});
-recall().catch(() => undefined).then((body) => process.stdout.write(`${body ?? "{}"}\n`));
+if (process.argv[2] === "--codemode-only") {
+	const deny = JSON.stringify({
+		decision: "deny",
+		reason: "Code Mode only: use codemode through the Pi bridge instead of native tools.",
+	});
+	codeModeToolDecision().catch(() => undefined).then((body) => process.stdout.write(`${body ?? deny}\n`));
+} else {
+	recall().catch(() => undefined).then((body) => process.stdout.write(`${body ?? "{}"}\n`));
+}

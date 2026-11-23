@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { test } from "vitest";
 import { MAX_FRAME_BYTES } from "../src/frame-guard.js";
@@ -19,6 +19,19 @@ function invoke(hook: AcpRecallHook, conversationId: string, extraEnv: Record<st
 		child.stdin!.end(JSON.stringify({ conversationId }));
 	});
 }
+
+test("the private Code Mode policy allows only pi-bridge codemode dispatch", () => {
+	const decision = (toolCall: object) => JSON.parse(execFileSync(
+		process.execPath, [client, "--codemode-only"],
+		{ input: JSON.stringify({ hookEventName: "PreToolUse", toolCall }), encoding: "utf8" },
+	)).decision;
+	const dispatch = { name: "call_mcp_tool", args: { ServerName: "pi-bridge", ToolName: "codemode" } };
+	assert.equal(decision(dispatch), "allow");
+	assert.equal(decision({ ...dispatch, args: { ...dispatch.args, ToolName: "bridge_poll_result" } }), "deny");
+	assert.equal(decision({ ...dispatch, args: { ...dispatch.args, ServerName: "other-mcp" } }), "deny");
+	assert.equal(decision({ name: "list_resources" }), "deny");
+	assert.equal(decision({ name: "manage_task" }), "deny");
+});
 
 test("the shipped AGY hook exposes only the active conversation and the current turn", async () => {
 	const hook = await createAcpRecallHook();

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { getCurrentTools, type Message, type SystemMessage, type Tool } from "@earendil-works/pi-ai";
-import { BRIDGE_POLL_TOOL, bridgedPiTools, projectCodeModeOnlyTools, toBridgeCatalog } from "../src/bridge-catalog.js";
+import { getCurrentTools, type Message, type Tool } from "@earendil-works/pi-ai";
+import { CODEMODE_POLL_ARG, acpCodeModeCatalog, bridgedPiTools } from "../src/bridge-catalog.js";
+import { buildAcpAgentBody, formatEscalatedAck } from "../src/provider.js";
 
 const all = [
 	{ name: "web_search", sourceInfo: { source: "pi-web-search" } },
@@ -23,27 +24,42 @@ describe("live Pi bridge catalog", () => {
 		expect(bridgedPiTools(all, active, "mcp", new Set()).map((t) => t.name)).toEqual(["mcp:files"]);
 		expect(bridgedPiTools(all, active, "none", new Set()).map((t) => t.name)).toEqual([]);
 	});
-	it("projects ACP Code Mode only from Pi declarations, without loading discovered tools", () => {
+	it("exposes only codemode to ACP without rewriting Pi's worker allowlist", () => {
+		const code = { type: "string" };
 		const codemode: Tool = {
 			name: "codemode",
 			description: "Pi's final Code Mode instructions",
-			parameters: { type: "object", properties: { code: { type: "string" } }, required: ["code"] },
+			parameters: { type: "object", properties: { code }, required: ["code"] },
 		};
 		const tool = (name: string): Tool => ({ name, description: name, parameters: { type: "object" } });
-		const question = tool("ask_user_question");
-		const input = { role: "user", content: "Find an authorized tool.", timestamp: 3 } as const;
+		const otherNames = ["read", "write", "ask_user_question", "tool_search", "bridge_poll_result"];
 		const messages: Message[] = [
-			{ role: "system", content: "", toolsAdded: [codemode, question, tool("tool_search"), tool("hidden")], timestamp: 1 },
+			{ role: "system", content: "", toolsAdded: [codemode, ...otherNames.map(tool)], timestamp: 1 },
 			{ role: "system", content: "", toolsAdded: [tool("loaded_deferred")], timestamp: 2 },
-			input,
+			{ role: "user", content: "Find an authorized tool.", timestamp: 3 },
 		];
-		const modelOnly = new Set(["codemode", "ask_user_question", "tool_search", "hidden"]);
-		const allowed = new Set(["codemode", "ask_user_question", "tool_search", "loaded_deferred", "not_declared"]);
-		const projected = projectCodeModeOnlyTools(messages, modelOnly, allowed);
-		const tools = getCurrentTools(projected!.filter((message): message is SystemMessage => message.role === "system"));
-		expect(toBridgeCatalog(tools)).toEqual(toBridgeCatalog([codemode, question, BRIDGE_POLL_TOOL]));
-		expect(projected?.at(-1)).toBe(input);
-		expect(getCurrentTools(messages).map(({ name }) => name)).toContain("loaded_deferred");
+		const catalog = acpCodeModeCatalog(messages);
+		expect(catalog.map((entry) => entry.name)).toEqual(["codemode"]);
+		expect(catalog[0]).toMatchObject({
+			description: codemode.description,
+			inputSchema: {
+				properties: { code, [CODEMODE_POLL_ARG]: { type: "string" } },
+				oneOf: [{ required: ["code"] }, { required: [CODEMODE_POLL_ARG] }],
+			},
+		});
+		expect(getCurrentTools(messages).map(({ name }) => name)).toEqual(["codemode", ...otherNames, "loaded_deferred"]);
+		expect(codemode.parameters).toMatchObject({ required: ["code"] });
+		expect(acpCodeModeCatalog([...messages, {
+			role: "system", content: "", toolsRemoved: [{ name: "codemode" }], timestamp: 4,
+		}])).toEqual([]);
+
+		const body = buildAcpAgentBody(undefined, catalog, true);
+		expect(body).toContain(CODEMODE_POLL_ARG);
+		expect(body).not.toContain("bridge_poll_result");
+		const escalation = { escalated: true, name: "codemode", callId: "test-id" } as const;
+		expect(JSON.stringify(formatEscalatedAck(escalation, true))).not.toContain("bridge_poll_result");
+		expect(JSON.stringify(formatEscalatedAck(escalation, true))).toContain(CODEMODE_POLL_ARG);
+		expect(JSON.stringify(formatEscalatedAck(escalation))).toContain("bridge_poll_result");
 	});
 
 	it("never exposes the bridge's own tools, including the web wrappers", () => {

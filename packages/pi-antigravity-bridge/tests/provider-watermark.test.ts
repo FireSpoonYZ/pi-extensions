@@ -31,6 +31,7 @@ import {
 import { resetSyspromptAgentForTests } from "../src/sysprompt-agent.js";
 import { SessionStore } from "../src/sessions.js";
 import type { ProjectHindsightRecall } from "../src/hindsight-recall.js";
+import type { BridgeCatalogEntry } from "../src/bridge-catalog.js";
 import type { StreamDriver, DriverTurnRequest } from "../src/driver.js";
 
 const SYS = "You are pi. Follow AGENTS.md.";
@@ -72,7 +73,7 @@ interface Harness {
  *  status/aborted/error to shape failed or aborted turns. */
 type FakeOutcome = string | { conversationId?: string; status?: "OK" | "ERROR" | "UNKNOWN"; aborted?: boolean; error?: string };
 
-function harness(outcomes: FakeOutcome[], projectHindsightRecall?: ProjectHindsightRecall): Harness {
+function harness(outcomes: FakeOutcome[], projectHindsightRecall?: ProjectHindsightRecall, toolCatalog?: BridgeCatalogEntry[]): Harness {
 	const seen: { opts?: DriverTurnRequest } = {};
 	const driver: StreamDriver = {
 		run: async (opts: DriverTurnRequest) => {
@@ -100,7 +101,8 @@ function harness(outcomes: FakeOutcome[], projectHindsightRecall?: ProjectHindsi
 		store,
 		driver,
 		roundTrips: new ToolRoundTrips(driver),
-		...(projectHindsightRecall ? { engine: "acp" as const, acpDriver: driver, projectHindsightRecall } : {}),
+		...(projectHindsightRecall || toolCatalog ? { engine: "acp" as const, acpDriver: driver, projectHindsightRecall } : {}),
+		...(toolCatalog ? { acpToolCatalog: () => toolCatalog } : {}),
 	});
 	return { seen, streamSimple, store, storePath: path.join(dir, "sessions.json"), dir };
 }
@@ -310,6 +312,30 @@ test("aborted turn on the same conversation: watermark is not advanced", async (
 			fs.rmSync(h.dir, { recursive: true, force: true });
 		}
 	});
+});
+
+test("a Code Mode only ACP turn migrates history without loading the old native tool profile", async () => {
+	const catalog = [{ name: "codemode", description: "Run a Pi script", inputSchema: {} }];
+	const h = harness(["strict-session", "strict-session"], () => undefined, catalog);
+	try {
+		await withEnv({ AGY_DIGEST: "off", AGY_AGENTS_ROOT: h.dir, AGY_SYSTEM_PROMPT: "off" }, async () => {
+			const options = { cwd: h.dir, sessionId: "existing" } as SimpleStreamOptions;
+			const prior = { conversationId: "old-session", lastStepIdx: -1, lastMessageCount: 1 };
+			h.store.set("sid:existing@acp-v3", prior);
+			await h.streamSimple(model, contextWith(["Old user message", "Current user message"]), options).result();
+			assert.equal(h.seen.opts?.conversationId, null);
+			assert.equal(h.seen.opts?.prompt, "Current user message");
+			assert.ok(h.seen.opts?.contextBlock?.text.includes("Old user message"));
+			assert.ok(!h.seen.opts?.contextBlock?.text.includes("Current user message"), "do not replay the new prompt as history");
+			assert.deepEqual(h.seen.opts?.toolCatalog, catalog);
+			await h.streamSimple(model, contextWith(["Next turn"]), options).result();
+			assert.equal(h.seen.opts?.conversationId, "strict-session");
+			assert.deepEqual(h.store.get("sid:existing@acp-v3"), prior);
+		});
+	} finally {
+		await h.store.flush();
+		fs.rmSync(h.dir, { recursive: true, force: true });
+	}
 });
 
 test("an old ACP binding migrates on the first recall and retries without losing the original history", async () => {

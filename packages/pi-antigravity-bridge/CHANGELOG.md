@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- ACP Code Mode only advertises and accepts only `codemode` over MCP without rewriting Pi's tool declarations or aborting workers with explicit allowlists. Poll long calls through `codemode` and reject native calls other than dispatch to the private bridge's `codemode`.
+
 ## [1.10.13] - 2026-11-22
 
 ### Fixed
