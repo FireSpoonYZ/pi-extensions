@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.10.15] - 2026-11-23
+
+### Fixed
+
+- Keep ACP Code Mode only working after `session/load` on AGY 1.5.15: the private hook accepts both the direct `mcp_pi-bridge_codemode` tool and dispatch through `call_mcp_tool`. The carrier describes both call forms and keeps polling on the same tool, without allowing other native or MCP tools.
+
 ## [1.10.14] - 2026-11-23
 
 ### Fixed
